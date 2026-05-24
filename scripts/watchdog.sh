@@ -51,54 +51,31 @@ if [ "$NEED_RESTART" = false ]; then
   fi
 fi
 
-# 3. pi 进程是否存活（仅在宽限期过后检查）
+# 3. 检查是否有活跃的 pi 会话
+# （per-user 模式下不再有全局 pi 状态，而是看 sessions 数量）
 if [ "$NEED_RESTART" = false ]; then
-  PI_STATUS=$(echo "$HEALTH" | grep -o '"pi":"[^"]*"' | head -1 | sed 's/"pi":"//;s/"//')
-  if [ "$PI_STATUS" = "restarting" ]; then
-    # pi 正在自动重启中，不干预
-    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$TIMESTAMP] ℹ️ pi 正在重启中，跳过" >> "$WATCHDOG_LOG"
-    exit 0
-  fi
-
-  if [ "$PI_STATUS" != "running" ]; then
-    # pi 已死，先尝试通过 /pi-restart 端点重启 pi，不杀 bridge
-    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$TIMESTAMP] ⚠️ pi 进程已死，尝试通过 /pi-restart 端点重启..." >> "$WATCHDOG_LOG"
-    RESTART_RESULT=$(curl -s --connect-timeout 5 --max-time 30 -X POST http://localhost:3100/pi-restart 2>/dev/null)
-    if echo "$RESTART_RESULT" | grep -q '"status":"ok"'; then
-      echo "[$TIMESTAMP] ✅ pi 通过 /pi-restart 重启成功" >> "$WATCHDOG_LOG"
-      echo "0" > "$STUCK_FLAG" 2>/dev/null
-      exit 0
-    elif echo "$RESTART_RESULT" | grep -q '"status":"already_restarting"'; then
-      echo "[$TIMESTAMP] ℹ️ pi 已在重启中" >> "$WATCHDOG_LOG"
-      exit 0
-    else
-      # /pi-restart 失败，降级为杀整个 bridge 重启
-      NEED_RESTART=true
-      REASON="pi 进程已死且 /pi-restart 失败: $RESTART_RESULT"
-    fi
-  fi
-fi
-
-# 4. isPiBusy 卡住检测（连续 5 分钟 busy = 连续 5 次 cron 检查都 busy）
-if [ "$NEED_RESTART" = false ]; then
-  IS_BUSY=$(echo "$HEALTH" | grep -o '"isPiBusy":true' || true)
-  if [ -n "$IS_BUSY" ]; then
-    # 累加 stuck 计数
+  # 检查是否有任何 busy 的会话卡住
+  BUSY_USERS=$(echo "$HEALTH" | grep -o '"busy":true' || true)
+  if [ -n "$BUSY_USERS" ]; then
+    # 有 busy 用户，累加 stuck 计数
     COUNT=$(cat "$STUCK_FLAG" 2>/dev/null || echo "0")
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$STUCK_FLAG"
-    if [ "$COUNT" -ge 5 ]; then
-      # 卡住了，尝试 abort 而非杀进程
+    if [ "$COUNT" -ge 10 ]; then
+      # busy 卡住超过10分钟，尝试 /pi-restart 重启所有会话
       TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-      echo "[$TIMESTAMP] ⚠️ isPiBusy 卡住超过5分钟 (stuck=$COUNT)，发送 /abort" >> "$WATCHDOG_LOG"
-      curl -s --connect-timeout 5 --max-time 10 "http://localhost:3100/wxwork/callback?msg_signature=internal&timestamp=$(date +%s)&nonce=watchdog" -X POST -d '<xml><MsgType>text</MsgType><Content>/abort</Content><FromUserName>watchdog</FromUserName></xml>' >/dev/null 2>&1
-      # 不需要杀进程，abort 后 isPiBusy 自然释放
-      echo "0" > "$STUCK_FLAG" 2>/dev/null
+      echo "[$TIMESTAMP] ⚠️ busy 卡住超过10min (stuck=$COUNT)，重启所有会话" >> "$WATCHDOG_LOG"
+      RESTART_RESULT=$(curl -s --connect-timeout 5 --max-time 30 -X POST http://localhost:3100/pi-restart 2>/dev/null)
+      if echo "$RESTART_RESULT" | grep -q '"status":"ok"'; then
+        echo "[$TIMESTAMP] ✅ 会话重启成功" >> "$WATCHDOG_LOG"
+        echo "0" > "$STUCK_FLAG" 2>/dev/null
+      else
+        NEED_RESTART=true
+        REASON="busy 卡住且 /pi-restart 失败"
+      fi
     fi
   else
-    # 不 busy，清零计数
+    # 没有 busy 会话，清零计数
     echo "0" > "$STUCK_FLAG" 2>/dev/null
   fi
 fi
