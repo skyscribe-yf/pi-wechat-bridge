@@ -7,6 +7,15 @@ import { parseStringPromise } from 'xml2js';
 import dotenv from 'dotenv';
 import { encrypt, decrypt, verifySignature } from './wxwork-crypto.js';
 import { sendTextMessage, sendMarkdownMessage } from './wxwork-api.js';
+
+// 安全发送消息：失败时记录日志但不抛异常，避免影响主流程
+async function safeSend(config, userId, text) {
+  try {
+    await sendTextMessage(config, userId, text);
+  } catch (err) {
+    console.error('[msg] 发送消息失败:', err.message);
+  }
+}
 import { PiRpcClient } from './pi-rpc-client.js';
 
 dotenv.config();
@@ -183,13 +192,13 @@ async function handleMessage(msg) {
   // 用户权限检查
   if (config.allowedUsers.length > 0 && !config.allowedUsers.includes(userId)) {
     console.log(`[msg] 用户 ${userId} 不在允许列表中`);
-    await sendTextMessage(config, userId, '⚠️ 你没有使用此 Bot 的权限。请联系管理员配置 ALLOWED_USERS。');
+    await safeSend(config, userId, '⚠️ 你没有使用此 Bot 的权限。请联系管理员配置 ALLOWED_USERS。');
     return;
   }
 
   // 只处理文本消息
   if (msgType !== 'text' || !content) {
-    await sendTextMessage(config, userId, '⚠️ 目前只支持文本消息。');
+    await safeSend(config, userId, '⚠️ 目前只支持文本消息。');
     return;
   }
 
@@ -221,15 +230,15 @@ async function handleMessage(msg) {
     if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
     if (piClient && !piClient.proc) {
       // pi 进程挂了，重启
-      await sendTextMessage(config, userId, '🔄 pi 进程已退出，正在重启...');
+      await safeSend(config, userId, '🔄 pi 进程已退出，正在重启...');
       try {
-        await startPi();
-        await sendTextMessage(config, userId, '✅ pi 已重启，状态已重置');
+        await startPi({ isRestart: true });
+        await safeSend(config, userId, '✅ pi 已重启，状态已重置');
       } catch (err) {
-        await sendTextMessage(config, userId, `❌ 重启失败: ${err.message}`);
+        await safeSend(config, userId, `❌ 重启失败: ${err.message}`);
       }
     } else {
-      await sendTextMessage(config, userId, '✅ 状态已重置，可以继续发消息了');
+      await safeSend(config, userId, '✅ 状态已重置，可以继续发消息了');
     }
     return;
   }
@@ -239,7 +248,7 @@ async function handleMessage(msg) {
     if (piClient && piClient.proc) piClient.abort();
     isPiBusy = false;
     if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-    await sendTextMessage(config, userId, '✅ 已中止当前操作。');
+    await safeSend(config, userId, '✅ 已中止当前操作。');
     return;
   }
 
@@ -263,7 +272,7 @@ async function handleMessage(msg) {
         `- 是否正在处理: ${state?.isStreaming ? '是' : '否'}\n` +
         `- 会话消息数: ${state?.messageCount || 0}`);
     } catch (err) {
-      await sendTextMessage(config, userId, `❌ 获取状态失败: ${err.message}`);
+      await safeSend(config, userId, `❌ 获取状态失败: ${err.message}`);
     } finally {
       isPiBusy = false;
     }
@@ -334,9 +343,9 @@ async function handleMessage(msg) {
       const result = await piClient.setModel(modelMatch.provider, modelMatch.modelId);
       const modelName = result?.name || modelMatch.name;
       const listLink = content.startsWith('/model') ? '' : '\n💡 发 /models 看全部模型';
-      await sendTextMessage(config, userId, `✅ 已切换到 ${modelName}${listLink}`);
+      await safeSend(config, userId, `✅ 已切换到 ${modelName}${listLink}`);
     } catch (err) {
-      await sendTextMessage(config, userId, `❌ 切换失败: ${err.message}\n试试发 /models 查看可用模型`);
+      await safeSend(config, userId, `❌ 切换失败: ${err.message}\n试试发 /models 查看可用模型`);
     } finally {
       isPiBusy = false;
     }
@@ -367,9 +376,9 @@ async function handleMessage(msg) {
           text += `  ${provider}/${id}\n`;
         }
       }
-      await sendTextMessage(config, userId, text);
+      await safeSend(config, userId, text);
     } catch (err) {
-      await sendTextMessage(config, userId, `❌ 获取列表失败: ${err.message}`);
+      await safeSend(config, userId, `❌ 获取列表失败: ${err.message}`);
     } finally {
       isPiBusy = false;
     }
@@ -388,9 +397,9 @@ async function handleMessage(msg) {
     }
     try {
       await piClient.setThinkingLevel(level);
-      await sendTextMessage(config, userId, `✅ 思考等级已设为: ${level}`);
+      await safeSend(config, userId, `✅ 思考等级已设为: ${level}`);
     } catch (err) {
-      await sendTextMessage(config, userId, `❌ 设置失败: ${err.message}`);
+      await safeSend(config, userId, `❌ 设置失败: ${err.message}`);
     } finally {
       isPiBusy = false;
     }
@@ -408,7 +417,7 @@ async function handleMessage(msg) {
   }, 300000);
   try {
     // 先回复"正在处理"
-    await sendTextMessage(config, userId, '🤔 正在思考中...');
+    await safeSend(config, userId, '🤔 正在思考中...');
 
     const reply = await piClient.prompt(content, 300000);
 
@@ -416,7 +425,7 @@ async function handleMessage(msg) {
     // 如果超过限制，分段发送
     const MAX_LEN = 2000;
     if (reply.length <= MAX_LEN) {
-      await sendTextMessage(config, userId, reply);
+      await safeSend(config, userId, reply);
     } else {
       // 分段发送
       const chunks = [];
@@ -428,7 +437,7 @@ async function handleMessage(msg) {
 
       for (let i = 0; i < chunks.length; i++) {
         const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
-        await sendTextMessage(config, userId, prefix + chunks[i]);
+        await safeSend(config, userId, prefix + chunks[i]);
         // 避免发送太快被限流
         if (i < chunks.length - 1) {
           await new Promise(r => setTimeout(r, 500));
@@ -437,7 +446,7 @@ async function handleMessage(msg) {
     }
   } catch (err) {
     console.error('[msg] pi 处理失败:', err);
-    await sendTextMessage(config, userId, `❌ 处理失败: ${err.message}`);
+    await safeSend(config, userId, `❌ 处理失败: ${err.message}`);
   } finally {
     isPiBusy = false;
     if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }

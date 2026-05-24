@@ -12,6 +12,13 @@ let accessTokenCache = {
 };
 
 /**
+ * 强制清空 access_token 缓存（用于 token 过期时主动刷新）
+ */
+export function clearAccessTokenCache() {
+  accessTokenCache = { token: null, expiresAt: 0 };
+}
+
+/**
  * 获取企业微信 access_token
  * 有效期 7200 秒，提前 300 秒刷新
  */
@@ -62,6 +69,28 @@ export async function sendTextMessage(config, userId, content) {
     timeout: 15000,
   });
 
+  // 自动处理 token 过期（42001=已过期 40014=不合法）
+  if (resp.data.errcode === 42001 || resp.data.errcode === 40014) {
+    console.warn('[wxwork] access_token 过期，自动刷新并重试...');
+    clearAccessTokenCache();
+    const newToken = await getAccessToken(config.corpId, config.secret);
+    const retryResp = await axios.post(url, {
+      touser: userId,
+      msgtype: 'text',
+      agentid: Number(config.agentId),
+      text: { content },
+    }, {
+      params: { access_token: newToken },
+      timeout: 15000,
+    });
+    if (retryResp.data.errcode !== 0) {
+      console.error('[wxwork] 重试发送消息失败:', retryResp.data);
+      throw new Error(`发送消息失败: ${retryResp.data.errmsg}`);
+    }
+    console.log(`[wxwork] 消息已发送给 ${userId} (重试)`);
+    return retryResp.data;
+  }
+
   if (resp.data.errcode !== 0) {
     console.error('[wxwork] 发送消息失败:', resp.data);
     throw new Error(`发送消息失败: ${resp.data.errmsg}`);
@@ -87,6 +116,28 @@ export async function sendMarkdownMessage(config, userId, content) {
     params: { access_token: token },
     timeout: 15000,
   });
+
+  // 自动处理 token 过期（42001=已过期 40014=不合法）
+  if (resp.data.errcode === 42001 || resp.data.errcode === 40014) {
+    console.warn('[wxwork] access_token 过期，自动刷新并重试...');
+    clearAccessTokenCache();
+    const newToken = await getAccessToken(config.corpId, config.secret);
+    const retryResp = await axios.post(url, {
+      touser: userId,
+      msgtype: 'markdown',
+      agentid: Number(config.agentId),
+      markdown: { content },
+    }, {
+      params: { access_token: newToken },
+      timeout: 15000,
+    });
+    if (retryResp.data.errcode !== 0) {
+      console.error('[wxwork] 重试发送 Markdown 消息失败:', retryResp.data);
+      throw new Error(`发送消息失败: ${retryResp.data.errmsg}`);
+    }
+    console.log(`[wxwork] Markdown 消息已发送给 ${userId} (重试)`);
+    return retryResp.data;
+  }
 
   if (resp.data.errcode !== 0) {
     console.error('[wxwork] 发送 Markdown 消息失败:', resp.data);

@@ -47,12 +47,19 @@ if ! command -v pi &>/dev/null; then
   exit 1
 fi
 
-# 如果已有进程在跑，先杀掉
+# 如果已有进程在跑，先优雅停止，不响应则强制结束
 OLD_PID=$(lsof -t -i:3100 2>/dev/null || true)
 if [ -n "$OLD_PID" ]; then
   echo "🛑 发现已有进程 (PID: $OLD_PID)，正在停止..."
   kill $OLD_PID 2>/dev/null || true
   sleep 2
+  # 如果还在，强制结束（防止 graceful shutdown 超时导致端口冲突）
+  STILL_PID=$(lsof -t -i:3100 2>/dev/null || true)
+  if [ -n "$STILL_PID" ]; then
+    echo "   ⚠️ 进程未退出，强制结束..."
+    kill -9 $STILL_PID 2>/dev/null || true
+    sleep 1
+  fi
 fi
 
 # 日志轮转（超过 50MB 时备份）

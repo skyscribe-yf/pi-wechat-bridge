@@ -13,6 +13,11 @@ WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 BRIDGE_LOG="$LOG_DIR/bridge.log"
 STUCK_FLAG="$LOG_DIR/.busy-stuck-count"
 
+# watchdog 日志自身也做简单轮转（超过 10MB 时截断）
+if [ -f "$WATCHDOG_LOG" ] && [ "$(stat -c%s "$WATCHDOG_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
+  mv "$WATCHDOG_LOG" "$WATCHDOG_LOG.$(date +%Y%m%d%H%M%S).old"
+fi
+
 NEED_RESTART=false
 REASON=""
 
