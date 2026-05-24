@@ -53,7 +53,10 @@
 | `PI_MODEL` | 否 | 模型 ID |
 | `PI_THINKING` | 否 | 思考等级：`off`/`minimal`/`low`/`medium`/`high`/`xhigh`，默认 `medium` |
 | `PI_TOOLS` | 否 | 允许的工具列表，默认 `read,bash,edit,write,grep,find,ls` |
-| `PI_NO_SESSION` | 否 | 是否每次消息都新建会话，默认 `true` |
+| `PI_NO_SESSION` | 否 | 设 `true` 关闭会话持久化，默认 `false`（开启） |
+| `PI_APPEND_SYSTEM_PROMPT` | 否 | 追加 system prompt，引导 pi 输出格式 |
+| `PI_SESSION_IDLE_MS` | 否 | 空闲回收阈值（毫秒），默认 1800000（30min） |
+| `PI_BIN_PATH` | 否 | pi 可执行文件绝对路径 |
 | `BRIDGE_PORT` | 否 | 桥接服务器端口，默认 `3100` |
 | `ALLOWED_USERS` | 否 | 允许的用户 UserID，逗号分隔，留空则允许所有人 |
 
@@ -69,21 +72,29 @@
 
 ## 核心逻辑与注意事项
 
-### 1. 消息处理时序（server.js）
+### 1. Per-User 会话管理
 
-企业微信要求 **5 秒内响应**，因此 POST `/wxwork/callback` 的处理逻辑是：
+每个用户拥有独立的 pi 进程和会话上下文。用户首次发消息时惰性创建 `UserSession`，空闲超过 30 分钟自动回收。
+
+- `UserSession` 类封装了 `PiRpcClient`、busy 锁、streamBuffer 等
+- 会话持久化：默认 `PI_NO_SESSION=false`，同一用户多轮对话共享 pi 上下文
+- `/clear` 命令：停止当前 pi 进程并删除会话，下次发消息时重新创建
+- 空闲回收：每分钟检查一次，超过 `PI_SESSION_IDLE_MS`（默认 30min）的空闲会话自动 stop
+- 进程退出自动重启：`UserSession` 监听 pi 进程 exit 事件，2 秒后自动重启
+
+### 2. 消息处理时序
+
+企业微信要求 **5 秒内响应**，POST `/wxwork/callback` 的处理：
 1. 验签、解密
-2. 立即 `res.send('')`（空响应）
-3. 再异步调用 `handleMessage(msg)` 处理业务
+2. 立即 `res.send('')`
+3. 异步 `handleMessage(msg)` 处理业务
 
-这意味着 pi 的回复是通过**主动调用企业微信消息发送 API** 实现的，而不是通过 HTTP Response。
+### 3. 活动感知超时
 
-### 2. pi 并发锁（isPiBusy）
-
-pi 目前不支持并发处理多个 prompt，因此 `server.js` 维护了一个 `isPiBusy` 标志：
-- 收到新消息时，如果 `isPiBusy === true`，回复用户"正在处理中"
-- 处理完成后（或 `/abort`、5 分钟超时后）释放锁
-- `/status`、`/abort`、`/reset`、`/help` 等命令不占用锁或可在锁期间执行
+- **静默超时**：pi 连续 2 分钟无产出 → 释放锁
+- **硬上限**：单次 prompt 最多 10 分钟 → 中止
+- **续期**：任何 `onProgress` 事件重置静默计时器
+- 每 30 秒检查一次
 
 ### 3. pi RPC 协议（pi-rpc-client.js）
 
@@ -218,9 +229,11 @@ curl http://localhost:3100/health
 |------|----------|
 | 支持更多消息类型（图片、文件） | `server.js` 的 `handleMessage`，解析 `msg.MsgType` |
 | 添加新模型别名 | `server.js` 的 `modelAliases` |
-| 修改 pi 超时时间 | `server.js` 的 `busyTimer`（默认 5 分钟）和 `piClient.prompt(content, timeout)` |
-| 添加新 Bot 命令 | `server.js` 的 `handleMessage`，在 `isPiBusy` 检查前或后添加分支 |
-| 更换消息推送通道 | 替换 `wxwork-api.js` 中的 API 调用 |
+| 修改超时时间 | `server.js` 的 `ACTIVITY_TIMEOUT` / `HARD_TIMEOUT` |
+| 添加新 Bot 命令 | `server.js` 的 `handleMessage` |
+| 更换消息推送通道 | 替换 `wxwork-api.js` |
+| 修改 system prompt | `PI_APPEND_SYSTEM_PROMPT` 环境变量 |
+| 修改空闲回收时间 | `PI_SESSION_IDLE_MS` 环境变量 |
 
 ## 安全红线
 

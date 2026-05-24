@@ -1,6 +1,8 @@
 /**
  * pi-wechat-bridge 主服务器
  * 将企业微信消息转发给 pi agent，并将 pi 的回复发回微信
+ *
+ * 架构：per-user pi 进程 + 会话持久化 + 活动感知超时
  */
 import express from 'express';
 import { parseStringPromise } from 'xml2js';
@@ -8,15 +10,6 @@ import dotenv from 'dotenv';
 import { encrypt, decrypt, verifySignature } from './wxwork-crypto.js';
 import { sendTextMessage, sendMarkdownMessage, updateCallbackUrl } from './wxwork-api.js';
 import { TunnelManager } from './tunnel.js';
-
-// 安全发送消息：失败时记录日志但不抛异常，避免影响主流程
-async function safeSend(config, userId, text) {
-  try {
-    await sendTextMessage(config, userId, text);
-  } catch (err) {
-    console.error('[msg] 发送消息失败:', err.message);
-  }
-}
 import { PiRpcClient } from './pi-rpc-client.js';
 import { StreamBuffer } from './stream-buffer.js';
 
@@ -25,11 +18,9 @@ dotenv.config();
 // ===== 全局错误处理 =====
 process.on('uncaughtException', (err) => {
   console.error('[fatal] 未捕获的异常:', err);
-  // 给日志 flush 一点时间，然后退出
   setTimeout(() => process.exit(1), 500);
 });
-
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('[fatal] 未处理的 Promise 拒绝:', reason);
 });
 
@@ -42,15 +33,19 @@ const config = {
   encodingAesKey: process.env.WXWORK_ENCODING_AES_KEY,
   bridgePort: Number(process.env.BRIDGE_PORT) || 3100,
   allowedUsers: process.env.ALLOWED_USERS?.split(',').filter(Boolean) || [],
+  piBin: process.env.PI_BIN_PATH || 'pi',
   piProvider: process.env.PI_PROVIDER,
   piModel: process.env.PI_MODEL,
   piThinking: process.env.PI_THINKING || 'medium',
   piTools: process.env.PI_TOOLS || 'read,bash,edit,write,grep,find,ls',
   piCwd: process.env.PI_CWD || process.cwd(),
-  piNoSession: process.env.PI_NO_SESSION !== 'false',
+  // 默认 false — 开启会话持久化，同一用户多轮对话共享上下文
+  piNoSession: process.env.PI_NO_SESSION === 'true',
   piNoExtensions: process.env.PI_NO_EXTENSIONS === 'true',
   piNoSkills: process.env.PI_NO_SKILLS === 'true',
   piNoContextFiles: process.env.PI_NO_CONTEXT_FILES === 'true',
+  piSessionIdleMs: Number(process.env.PI_SESSION_IDLE_MS) || 30 * 60 * 1000,
+  piAppendSystemPrompt: process.env.PI_APPEND_SYSTEM_PROMPT || '',
   adminUser: process.env.ADMIN_USER || process.env.ALLOWED_USERS?.split(',')[0]?.trim() || '',
 };
 
@@ -60,38 +55,59 @@ const missing = required.filter(k => !process.env[k]);
 if (missing.length > 0) {
   console.error(`❌ 缺少必需配置: ${missing.join(', ')}`);
   console.error('请复制 .env.example 为 .env 并填写企业微信应用配置');
-  console.error('参考 README.md 中的"企业微信配置步骤"');
   process.exit(1);
 }
 
-  // ===== pi RPC 客户端 =====
-  let piClient = null;
-  let isPiBusy = false;
-  let busyTimer = null;
-  let piRestarting = false; // 标记 pi 正在自动重启中，health 端点用
-
-// ===== Tunnel 管理 =====
-let tunnelManager = null;
+// ===== Per-User Session 管理 =====
+/** @type {Map<string, UserSession>} */
+const userSessions = new Map();
+let idleEvictTimer = null;
 
 // ===== 流式状态（按用户 opt-in） =====
-/** @type {Map<string, boolean>} userId -> streaming enabled */
+/** @type {Map<string, boolean>} */
 const userStreamEnabled = new Map();
-/** 当前活跃的 StreamBuffer（用于 /abort）。受 isPiBusy 单租约束。*/
-let activeStreamBuffer = null;
+
+// ===== 多段输入状态 =====
+/** @type {Map<string, string[]>} */
+const composingUsers = new Map();
 
 function isStreamingEnabledFor(userId) {
   return userStreamEnabled.get(userId) === true;
 }
-
 function setStreamingEnabledFor(userId, enabled) {
   if (enabled) userStreamEnabled.set(userId, true);
   else userStreamEnabled.delete(userId);
 }
 
-async function startPi({ isRestart = false } = {}) {
-  const createClient = () => {
-    const client = new PiRpcClient({
-      piBin: process.env.PI_BIN_PATH || 'pi',
+// ===== 模型别名 =====
+const modelAliases = {
+  '讯飞': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
+  'xunfei': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
+  'astron': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
+  'deepseek': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  'deepseek闪': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  'deepseek-flash': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  'deepseek-pro': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  'kimi': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
+  'kimi-k2.6': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
+  'mimo': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
+  'mimo-pro': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
+  'mimo-flash': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: 'MiMo V2 Flash' },
+  'xiaomi': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: '小米 MiMo' },
+  'claude': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+  'sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+  'claude-sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+  'gpt': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
+  'gpt-5': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
+  '可灵': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
+};
+
+// ===== UserSession 类 =====
+class UserSession {
+  constructor(userId) {
+    this.userId = userId;
+    this.client = new PiRpcClient({
+      piBin: config.piBin,
       cwd: config.piCwd,
       provider: config.piProvider,
       model: config.piModel,
@@ -101,41 +117,119 @@ async function startPi({ isRestart = false } = {}) {
       noExtensions: config.piNoExtensions,
       noSkills: config.piNoSkills,
       noContextFiles: config.piNoContextFiles,
+      appendSystemPrompt: config.piAppendSystemPrompt,
     });
+    this.busy = false;
+    this.busyTimer = null;
+    this.lastActive = Date.now();
+    this.streamBuffer = null;
+    this.starting = false;
 
-    // 监听进程退出，自动重启
-    client.on('exit', async ({ code }) => {
-      console.warn(`[pi-rpc] 进程退出 (code=${code})，2 秒后自动重启...`);
-      isPiBusy = false;
-      piRestarting = true;
-      if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
+    this.client.on('exit', async ({ code }) => {
+      console.warn(`[pi-rpc:${userId}] 进程退出 (code=${code})，2s 后重启...`);
+      this.busy = false;
+      this._clearBusyTimer();
+      this.streamBuffer = null;
       await new Promise(r => setTimeout(r, 2000));
       try {
-        await startPi({ isRestart: true });
-        console.log('✅ pi RPC 已自动重启');
+        await this.start();
+        console.log(`✅ [pi-rpc:${userId}] 已自动重启`);
       } catch (err) {
-        console.error('❌ pi RPC 自动重启失败:', err.message);
-      } finally {
-        piRestarting = false;
+        console.error(`❌ [pi-rpc:${userId}] 自动重启失败:`, err.message);
       }
     });
+  }
 
-    return client;
-  };
-
-  piClient = createClient();
-
-  try {
-    await piClient.start();
-    console.log('✅ pi RPC 客户端已启动');
-  } catch (err) {
-    console.error('❌ pi RPC 启动失败:', err.message);
-    console.error('请确保 pi 已安装 (npm install -g @earendil-works/pi-coding-agent)');
-    console.error('并且 ANTHROPIC_API_KEY 或其他 provider 的 API key 已设置');
-    if (!isRestart) {
-      process.exit(1);
+  async start() {
+    this.starting = true;
+    try {
+      await this.client.start();
+      this.lastActive = Date.now();
+      console.log(`✅ [pi-rpc:${this.userId}] 客户端已启动 (PID: ${this.client.proc?.pid})`);
+    } catch (err) {
+      console.error(`❌ [pi-rpc:${this.userId}] 启动失败:`, err.message);
+      throw err;
+    } finally {
+      this.starting = false;
     }
-    throw err; // 让调用方（exit handler）的 catch 能捕获到
+  }
+
+  stop() {
+    this.client.stop();
+    this.busy = false;
+    this._clearBusyTimer();
+    this.streamBuffer = null;
+  }
+
+  isAlive() {
+    if (!this.client?.proc?.pid || this.client.proc.killed) return false;
+    try { return process.kill(this.client.proc.pid, 0); } catch { return false; }
+  }
+
+  releaseBusy() {
+    this.busy = false;
+    this._clearBusyTimer();
+    this.streamBuffer = null;
+  }
+
+  _clearBusyTimer() {
+    if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
+  }
+}
+
+/**
+ * 获取或创建用户会话（惰性启动）
+ */
+async function getUserSession(userId) {
+  if (!userSessions.has(userId)) {
+    const session = new UserSession(userId);
+    userSessions.set(userId, session);
+    await session.start();
+    scheduleIdleEviction();
+  }
+  const session = userSessions.get(userId);
+  session.lastActive = Date.now();
+  // pi 进程挂了但 session 对象还在 → 重启
+  if (!session.isAlive() && !session.starting) {
+    console.log(`[pi-rpc:${userId}] 进程已死，重启中...`);
+    await session.start();
+  }
+  return session;
+}
+
+/**
+ * 定期清理空闲超过 piSessionIdleMs 的用户会话
+ */
+function scheduleIdleEviction() {
+  if (idleEvictTimer) return;
+  idleEvictTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [userId, session] of userSessions) {
+      if (!session.busy && now - session.lastActive > config.piSessionIdleMs) {
+        console.log(`[session] 回收空闲会话: ${userId} (${Math.round((now - session.lastActive) / 60000)}min)`);
+        session.stop();
+        userSessions.delete(userId);
+      }
+    }
+    if (userSessions.size === 0) {
+      clearInterval(idleEvictTimer);
+      idleEvictTimer = null;
+    }
+  }, 60_000);
+  idleEvictTimer.unref?.();
+}
+
+// ===== 安全发送消息：优先 Markdown，回落纯文本 =====
+async function safeSend(config, userId, text) {
+  try {
+    const isMarkdown = /`{1,3}[\s\S]*?`{1,3}|\*\*|^[>\-*#]/m.test(text);
+    if (isMarkdown) {
+      await sendMarkdownMessage(config, userId, text);
+    } else {
+      await sendTextMessage(config, userId, text);
+    }
+  } catch (err) {
+    try { await sendTextMessage(config, userId, text); } catch (e) { console.error('[msg] 发送消息失败:', e.message); }
   }
 }
 
@@ -146,17 +240,10 @@ const app = express();
 app.get('/wxwork/callback', async (req, res) => {
   try {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
-
-    // 验证签名
-    const valid = verifySignature(config.token, timestamp, nonce, echostr, msg_signature);
-    if (!valid) {
-      console.warn('[callback] 签名验证失败');
+    if (!verifySignature(config.token, timestamp, nonce, echostr, msg_signature)) {
       return res.status(403).send('签名验证失败');
     }
-
-    // 解密 echostr
     const reply = decrypt(config.corpId, config.encodingAesKey, echostr);
-    console.log('[callback] 验证成功，回显 echostr');
     res.send(reply);
   } catch (err) {
     console.error('[callback] 验证错误:', err);
@@ -166,42 +253,26 @@ app.get('/wxwork/callback', async (req, res) => {
 
 // 微信消息接收 (POST)
 app.post('/wxwork/callback', express.text({ type: 'text/xml' }), async (req, res) => {
-  // 标记是否已回复，防止重复 send
   let replied = false;
-  function safeReply() {
-    if (!replied) { replied = true; res.send(''); }
-  }
+  function safeReply() { if (!replied) { replied = true; res.send(''); } }
 
   try {
-    // 签名参数在 URL query 里（跟 GET 一样），不在 XML body 里
     const { msg_signature, timestamp, nonce } = req.query;
-
-    // 解析 XML body，只有 Encrypt 字段
     const xmlResult = await parseStringPromise(req.body, { explicitArray: false });
-    const wxMsg = xmlResult.xml;
-    const encryptContent = wxMsg.Encrypt;
+    const encryptContent = xmlResult.xml.Encrypt;
 
-    // 验证签名
-    const valid = verifySignature(config.token, timestamp, nonce, encryptContent, msg_signature);
-    if (!valid) {
-      console.warn('[msg] 签名验证失败', { msg_signature, timestamp, nonce, encryptContent: encryptContent?.slice(0, 20) });
+    if (!verifySignature(config.token, timestamp, nonce, encryptContent, msg_signature)) {
       return res.status(403).send('');
     }
 
-    // 解密消息
     const plainText = decrypt(config.corpId, config.encodingAesKey, encryptContent);
     const msgData = await parseStringPromise(plainText, { explicitArray: false });
     const msg = msgData.xml;
 
-    console.log(`[msg] 收到消息: From=${msg.FromUserName}, MsgType=${msg.MsgType}, Content=${msg.Content?.slice(0, 100)}`);
-
-    // 立即回复空消息（企业微信要求在5秒内响应）
+    console.log(`[msg] 收到消息: From=${msg.FromUserName}, Content=${msg.Content?.slice(0, 100)}`);
     safeReply();
 
-    // 异步处理消息（不阻塞响应）
-    handleMessage(msg).catch(err => {
-      console.error('[msg] 异步处理错误:', err);
-    });
+    handleMessage(msg).catch(err => console.error('[msg] 异步处理错误:', err));
   } catch (err) {
     console.error('[msg] 请求处理错误:', err);
     safeReply();
@@ -210,7 +281,7 @@ app.post('/wxwork/callback', express.text({ type: 'text/xml' }), async (req, res
 
 // ===== 消息处理 =====
 async function handleMessage(msg) {
-  const userId = msg.FromUserName; // 企业微信 UserID
+  const userId = msg.FromUserName;
   const msgType = msg.MsgType;
   const content = msg.Content?.trim();
 
@@ -227,30 +298,55 @@ async function handleMessage(msg) {
     return;
   }
 
-  // 特殊命令（不占用 pi 的并发锁）
+  // ===== /help =====
   if (content === '/help') {
-    await sendTextMessage(config, userId,
+    await safeSend(config, userId,
       '🤖 pi Agent 微信 Bot 命令\n\n' +
+      '💬 直接发消息 → pi 处理并回复（上下文连续）\n\n' +
+      '📝 多段输入:\n' +
+      '  /begin ... /end → 合并长消息\n\n' +
       '🎤 语音切换模型:\n' +
       '  "切换到 deepseek"\n' +
       '  "用 kimi"\n' +
-      '  "换讯飞"\n' +
-      '  "切到 mimo"\n' +
-      '  "用 claude"\n' +
-      '\n' +
+      '  "换讯飞"\n\n' +
       '⌨️ 文字命令:\n' +
       '  /model deepseek     切换模型\n' +
       '  /thinking high      思考等级\n' +
       '  /stream on|off      流式模式开关\n' +
+      '  /clear              清除会话上下文\n' +
       '  /status             查看状态\n' +
       '  /models             列出模型\n' +
       '  /abort              中止操作\n' +
-      '  /reset              强制重置(卡住时用)\n' +
       '  /help               帮助');
     return;
   }
 
-  // /stream on|off|status —— 每用户独立开关
+  // ===== 多段输入 /begin /end =====
+  if (content === '/begin') {
+    composingUsers.set(userId, []);
+    await safeSend(config, userId, '📝 开始多段输入，以 /end 结束');
+    return;
+  }
+
+  if (content === '/end') {
+    const parts = composingUsers.get(userId);
+    composingUsers.delete(userId);
+    if (!parts || parts.length === 0) {
+      await safeSend(config, userId, '⚠️ 没有输入内容');
+      return;
+    }
+    const fullMessage = parts.join('\n');
+    await safeSend(config, userId, `📝 已合并 ${parts.length} 段输入，开始处理...`);
+    return handlePiPrompt(userId, fullMessage);
+  }
+
+  if (composingUsers.has(userId)) {
+    composingUsers.get(userId).push(content);
+    await safeSend(config, userId, `📝 已追加 (${composingUsers.get(userId).length} 段)，继续输入或发 /end`);
+    return;
+  }
+
+  // ===== /stream on|off|status =====
   if (content === '/stream' || content.startsWith('/stream ')) {
     const arg = content === '/stream' ? 'status' : content.slice(8).trim().toLowerCase();
     if (arg === 'on') {
@@ -259,213 +355,212 @@ async function handleMessage(msg) {
     } else if (arg === 'off') {
       setStreamingEnabledFor(userId, false);
       await safeSend(config, userId, '✅ 流式模式已关闭');
-    } else if (arg === 'status' || arg === '') {
-      const on = isStreamingEnabledFor(userId);
+    } else {
       await safeSend(config, userId,
-        `📡 流式模式: ${on ? '开启' : '关闭'}\n` +
+        `📡 流式模式: ${isStreamingEnabledFor(userId) ? '开启' : '关闭'}\n` +
         '用法: /stream on | /stream off | /stream status');
-    } else {
-      await safeSend(config, userId, '⚠️ 用法: /stream on | /stream off | /stream status');
     }
     return;
   }
 
-  // /reset 命令 - 强制重置繁忙状态（任何时候都可执行）
-  if (content === '/reset') {
-    isPiBusy = false;
-    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-    if (piClient && !piClient.proc) {
-      // pi 进程挂了，重启
-      await safeSend(config, userId, '🔄 pi 进程已退出，正在重启...');
-      try {
-        await startPi({ isRestart: true });
-        await safeSend(config, userId, '✅ pi 已重启，状态已重置');
-      } catch (err) {
-        await safeSend(config, userId, `❌ 重启失败: ${err.message}`);
-      }
+  // ===== /clear — 清除会话上下文 =====
+  if (content === '/clear') {
+    const session = userSessions.get(userId);
+    if (session) {
+      session.stop();
+      userSessions.delete(userId);
+      await safeSend(config, userId, '🧹 会话已清除，下次发消息将创建新会话');
     } else {
-      await safeSend(config, userId, '✅ 状态已重置，可以继续发消息了');
+      await safeSend(config, userId, 'ℹ️ 当前没有活跃会话');
     }
     return;
   }
 
-  // /abort 命令 - 任何时候都可执行
+  // ===== /abort =====
   if (content === '/abort') {
-    if (piClient && piClient.proc) piClient.abort();
-    if (activeStreamBuffer) {
-      try { await activeStreamBuffer.abort(); }
-      catch (e) { console.error('[stream] abort 错误:', e?.message || e); }
-      activeStreamBuffer = null;
+    const session = userSessions.get(userId);
+    if (session?.busy) {
+      session.client.abort();
+      if (session.streamBuffer) {
+        try { await session.streamBuffer.abort(); } catch {}
+      }
+      session.releaseBusy();
+      await safeSend(config, userId, '✅ 已中止当前操作');
+    } else {
+      await safeSend(config, userId, 'ℹ️ 当前没有正在执行的操作');
     }
-    isPiBusy = false;
-    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-    await safeSend(config, userId, '✅ 已中止当前操作。');
     return;
   }
 
-  // 检查 pi 是否繁忙（在可能占用 pi 的操作之前统一检查）
-  if (isPiBusy) {
-    await sendTextMessage(config, userId, '⏳ pi 正在处理之前的请求，请稍后再发送新消息。');
-    return;
-  }
-
-  // 从这一刻起占用并发锁，防止后续命令与 pi prompt 发生竞态
-  isPiBusy = true;
-
+  // ===== /status =====
   if (content === '/status') {
-    try {
-      const state = await piClient.getState();
-      await sendTextMessage(config, userId,
-        `📊 pi 状态:\n` +
-        `- 模型: ${state?.model?.name || '未知'} (${state?.model?.provider || '?'})\n` +
-        `- 模型ID: ${state?.model?.id || '未知'}\n` +
-        `- 思考等级: ${state?.thinkingLevel || '未知'}\n` +
-        `- 是否正在处理: ${state?.isStreaming ? '是' : '否'}\n` +
-        `- 会话消息数: ${state?.messageCount || 0}`);
-    } catch (err) {
-      await safeSend(config, userId, `❌ 获取状态失败: ${err.message}`);
-    } finally {
-      isPiBusy = false;
+    const session = userSessions.get(userId);
+    const parts = [
+      `📊 会话状态:`,
+      `- pi 进程: ${session?.isAlive() ? 'running' : 'not started'}`,
+      `- 忙碌: ${session?.busy ?? false}`,
+      `- 流式: ${isStreamingEnabledFor(userId) ? '开启' : '关闭'}`,
+      `- 多段输入: ${composingUsers.has(userId) ? `进行中 (${composingUsers.get(userId)?.length} 段)` : '无'}`,
+    ];
+    if (session?.lastActive) {
+      const idleMin = Math.round((Date.now() - session.lastActive) / 60000);
+      parts.push(`- 空闲: ${idleMin}min`);
     }
+    if (session?.isAlive()) {
+      try {
+        const state = await session.client.getState();
+        if (state?.model) {
+          parts.push(`- 模型: ${state.model.name || state.model.id} (${state.model.provider})`);
+        }
+        if (state?.messageCount !== undefined) {
+          parts.push(`- 会话消息数: ${state.messageCount}`);
+        }
+      } catch {}
+    }
+    await safeSend(config, userId, parts.join('\n'));
     return;
   }
 
-  // ---- 智能模型切换 - 自然语言 ----
-  // 支持: "切换到 deepseek" "用 kimi" "换讯飞" "切到 mimo" 等
-  const modelAliases = {
-    '讯飞': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
-    'xunfei': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
-    'astron': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
-    'deepseek': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    'deepseek闪': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-    'deepseek-flash': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-    'deepseek-pro': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    'kimi': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
-    'kimi-k2.6': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
-    'mimo': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-    'mimo-pro': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-    'mimo-flash': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: 'MiMo V2 Flash' },
-    'xiaomi': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: '小米 MiMo' },
-    'claude': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
-    'sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
-    'claude-sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
-    'gpt': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
-    'gpt-5': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
-    '可灵': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
-  };
-
-  // 检查是否是模型切换指令（自然语言 + /model 命令）
+  // ===== /model 切换 =====
   let modelMatch = null;
-
-  // /model provider/modelId 格式
   if (content.startsWith('/model ')) {
     const modelStr = content.slice(7).trim();
     const parts = modelStr.split('/');
     if (parts.length === 2 && parts[0] && parts[1]) {
       modelMatch = { provider: parts[0], modelId: parts[1], name: modelStr };
     } else {
-      // 试试别名
-      const key = Object.keys(modelAliases).find(k => modelStr.includes(k));
+      const key = Object.keys(modelAliases).find(k => modelStr.toLowerCase().includes(k));
       if (key) modelMatch = modelAliases[key];
     }
   } else {
-    // 自然语言: "切换到xxx" "用xxx" "换xxx" "切到xxx"
+    // 自然语言切换
     const switchPatterns = [
       /^(切换|换|转到|切到|用|我想用|改用|帮我切换到)\s*(.+)$/,
       /^(切换|换|转到|切到|用|我想用|改用|帮我切换到)模型\s*(.+)$/,
       /^(.+?)(模型|试试|看看)$/,
     ];
-
     for (const pattern of switchPatterns) {
       const m = content.match(pattern);
       if (m) {
         const target = (m[2] || m[1] || '').toLowerCase().trim();
         const key = Object.keys(modelAliases).find(k => target.includes(k));
-        if (key) {
-          modelMatch = modelAliases[key];
-          break;
-        }
+        if (key) { modelMatch = modelAliases[key]; break; }
       }
     }
   }
 
   if (modelMatch) {
     try {
-      const result = await piClient.setModel(modelMatch.provider, modelMatch.modelId);
+      const session = await getUserSession(userId);
+      const result = await session.client.setModel(modelMatch.provider, modelMatch.modelId);
       const modelName = result?.name || modelMatch.name;
       const listLink = content.startsWith('/model') ? '' : '\n💡 发 /models 看全部模型';
       await safeSend(config, userId, `✅ 已切换到 ${modelName}${listLink}`);
     } catch (err) {
       await safeSend(config, userId, `❌ 切换失败: ${err.message}\n试试发 /models 查看可用模型`);
-    } finally {
-      isPiBusy = false;
     }
     return;
   }
 
-  // 列出可用模型
+  // ===== /models =====
   if (content === '/models') {
     try {
-      const result = await piClient.getAvailableModels();
+      const session = await getUserSession(userId);
+      const result = await session.client.getAvailableModels();
       const models = result?.models || [];
       if (models.length === 0) {
-        await sendTextMessage(config, userId, '⚠️ 没有获取到可用模型列表');
+        await safeSend(config, userId, '⚠️ 没有获取到可用模型列表');
         return;
       }
-      // 按 provider 分组显示前 20 个
       const grouped = {};
       for (const m of models) {
         if (!grouped[m.provider]) grouped[m.provider] = [];
-        if (grouped[m.provider].length < 5) {
-          grouped[m.provider].push(m.id);
-        }
+        if (grouped[m.provider].length < 5) grouped[m.provider].push(m.id);
       }
       let text = '📋 可用模型:\n';
       for (const [provider, ids] of Object.entries(grouped)) {
         text += `\n【${provider}】\n`;
-        for (const id of ids) {
-          text += `  ${provider}/${id}\n`;
-        }
+        for (const id of ids) text += `  \`${provider}/${id}\`\n`;
       }
       await safeSend(config, userId, text);
     } catch (err) {
       await safeSend(config, userId, `❌ 获取列表失败: ${err.message}`);
-    } finally {
-      isPiBusy = false;
     }
     return;
   }
 
-  // 设置思考等级: /thinking low|medium|high
+  // ===== /thinking =====
   if (content.startsWith('/thinking ')) {
     const level = content.slice(10).trim();
     const validLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
     if (!validLevels.includes(level)) {
-      isPiBusy = false;
-      await sendTextMessage(config, userId,
-        '⚠️ 等级: off, minimal, low, medium, high, xhigh');
+      await safeSend(config, userId, '⚠️ 等级: off, minimal, low, medium, high, xhigh');
       return;
     }
     try {
-      await piClient.setThinkingLevel(level);
+      const session = await getUserSession(userId);
+      await session.client.setThinkingLevel(level);
       await safeSend(config, userId, `✅ 思考等级已设为: ${level}`);
     } catch (err) {
       await safeSend(config, userId, `❌ 设置失败: ${err.message}`);
-    } finally {
-      isPiBusy = false;
     }
     return;
   }
 
-  // 发送给 pi 处理
-  // 安全超时：5 分钟后自动解除繁忙状态
-  busyTimer = setTimeout(() => {
-    if (isPiBusy) {
-      console.warn('[msg] ⚠️ pi 处理超时 (5min)，自动重置繁忙状态');
-      isPiBusy = false;
-      busyTimer = null;
-    }
-  }, 300000);
+  // ===== 默认：作为 pi prompt 处理 =====
+  return handlePiPrompt(userId, content);
+}
+
+// ===== pi prompt 处理（含活动感知超时 + 流式） =====
+async function handlePiPrompt(userId, content) {
+  // 获取或创建用户会话
+  let session;
+  try {
+    session = await getUserSession(userId);
+  } catch (err) {
+    console.error(`[pi-rpc:${userId}] 启动失败:`, err.message);
+    await safeSend(config, userId, '❌ pi 启动失败，请稍后重试');
+    return;
+  }
+
+  // 检查是否忙碌
+  if (session.busy) {
+    await safeSend(config, userId, '⏳ 正在处理中，请稍等或发 /abort 中止');
+    return;
+  }
+
+  session.busy = true;
+  session.lastActive = Date.now();
+
+  // ===== 活动感知超时 =====
+  let lastActivity = Date.now();
+  const ACTIVITY_TIMEOUT = 120_000;  // 真正静默 2 分钟
+  const HARD_TIMEOUT = 600_000;      // 硬上限 10 分钟
+  const CHECK_INTERVAL = 30_000;     // 每 30 秒检查
+
+  const promptStart = Date.now();
+
+  function startActivityMonitor() {
+    session._clearBusyTimer();
+    session.busyTimer = setTimeout(() => {
+      const idle = Date.now() - lastActivity;
+      const elapsed = Date.now() - promptStart;
+      if (elapsed > HARD_TIMEOUT) {
+        console.warn(`[pi-rpc:${userId}] 硬超时 (${Math.round(HARD_TIMEOUT / 1000)}s)`);
+        session.client.abort();
+        session.releaseBusy();
+        safeSend(config, userId, '⏰ 处理超时（硬上限 10min），已中止');
+      } else if (idle > ACTIVITY_TIMEOUT) {
+        console.warn(`[pi-rpc:${userId}] 静默超时 (${Math.round(idle / 1000)}s)`);
+        session.releaseBusy();
+        safeSend(config, userId, '⏰ pi 长时间无响应（2min），锁已释放。可用 /abort 强制中止');
+      } else {
+        startActivityMonitor();
+      }
+    }, CHECK_INTERVAL);
+  }
+
+  startActivityMonitor();
 
   const streaming = isStreamingEnabledFor(userId);
   let buffer = null;
@@ -475,65 +570,64 @@ async function handleMessage(msg) {
     // 先回复"正在处理"
     await safeSend(config, userId, streaming ? '🤔 思考中... (流式)' : '🤔 正在思考中...');
 
-    let promptArg = 300000;
+    let promptArg;
     if (streaming) {
       buffer = new StreamBuffer({
         send: (text) => safeSend(config, userId, text),
         logger: console.log,
       });
-      activeStreamBuffer = buffer;
+      session.streamBuffer = buffer;
       promptArg = {
-        timeout: 300000,
+        timeout: HARD_TIMEOUT,
         onProgress: (event) => {
+          lastActivity = Date.now();
           if (event.type === 'text_delta') streamedAnyText = true;
           buffer.handle(event);
         },
       };
+    } else {
+      promptArg = { timeout: HARD_TIMEOUT };
     }
 
-    const reply = await piClient.prompt(content, promptArg);
+    const reply = await session.client.prompt(content, promptArg);
 
     if (streaming) {
-      // flush 任何残留的 buffer（最后一段文字 + thinking）
       await buffer.finalize();
-      if (activeStreamBuffer === buffer) activeStreamBuffer = null;
-
-      // 边界：pi 没有产出任何 text_delta（极少数模型 / 极短回复）
+      session.streamBuffer = null;
       if (!streamedAnyText) {
         if (!reply || reply === '(无回复)') {
-          await safeSend(config, userId, '🤔 pi 没有返回内容，可能是当前任务不需要文字回复，或者处理中遇到了问题。你可以继续发送消息。');
+          await safeSend(config, userId, '🤔 pi 没有返回内容。你可以继续发送消息或发 /status 查看。');
         } else {
-          await sendChunked(userId, reply);
+          await sendChunked(config, userId, reply);
         }
       }
-      // streamedAnyText === true 时不再发完整回复，避免重复
       return;
     }
 
-    // ---------- 非流式路径（与原行为一致） ----------
+    // 非流式路径
     if (!reply || reply === '(无回复)') {
-      await safeSend(config, userId, '🤔 pi 没有返回内容，可能是当前任务不需要文字回复，或者处理中遇到了问题。你可以继续发送消息。');
+      await safeSend(config, userId, '🤔 pi 没有返回内容。你可以继续发送消息或发 /status 查看。');
       return;
     }
-    await sendChunked(userId, reply);
+    await sendChunked(config, userId, reply);
   } catch (err) {
-    console.error('[msg] pi 处理失败:', err);
+    console.error(`[pi-rpc:${userId}] prompt 失败:`, err.message);
     if (buffer) {
       try { await buffer.finalize(); } catch {}
-      if (activeStreamBuffer === buffer) activeStreamBuffer = null;
+      session.streamBuffer = null;
     }
-    await safeSend(config, userId, `❌ 处理失败: ${err.message}`);
+    if (!err.message?.includes('aborted') && !err.message?.includes('中止')) {
+      await safeSend(config, userId, `❌ 处理失败: ${err.message.substring(0, 100)}`);
+    }
   } finally {
-    isPiBusy = false;
-    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-    if (activeStreamBuffer === buffer) activeStreamBuffer = null;
+    session.releaseBusy();
   }
 }
 
 /**
  * 把过长的回复分段发出。企业微信单条文本约 2048 字符；超过 MAX_LEN 自动切片。
  */
-async function sendChunked(userId, reply) {
+async function sendChunked(config, userId, reply) {
   const MAX_LEN = 2000;
   if (reply.length <= MAX_LEN) {
     await safeSend(config, userId, reply);
@@ -554,19 +648,23 @@ async function sendChunked(userId, reply) {
 
 // ===== 健康检查 =====
 app.get('/health', (req, res) => {
-  // 真实检测 pi 子进程是否存活：proc.pid 可能还在但进程已退出
-  const piAlive = piClient?.proc?.pid && !piClient.proc.killed;
-  // 更可靠：尝试检查 /proc (Linux) 或 kill -0
-  let piActuallyRunning = false;
-  if (piAlive) {
-    try { piActuallyRunning = process.kill(piClient.proc.pid, 0); } catch { piActuallyRunning = false; }
+  const activeSessions = [];
+  let totalBusy = 0;
+  for (const [userId, session] of userSessions) {
+    activeSessions.push({
+      userId,
+      alive: session.isAlive(),
+      busy: session.busy,
+      idleMs: Date.now() - session.lastActive,
+      pid: session.client?.proc?.pid || null,
+    });
+    if (session.busy) totalBusy++;
   }
-
   res.json({
     status: 'ok',
-    pi: piActuallyRunning ? 'running' : (piRestarting ? 'restarting' : 'stopped'),
-    isPiBusy,
-    piPid: piClient?.proc?.pid || null,
+    activeUsers: userSessions.size,
+    busyUsers: totalBusy,
+    sessions: activeSessions,
     timestamp: new Date().toISOString(),
   });
 });
@@ -574,34 +672,47 @@ app.get('/health', (req, res) => {
 // ===== 更新企业微信回调 URL =====
 app.post('/update-callback', express.json(), async (req, res) => {
   const { url } = req.body;
-  if (!url) {
-    return res.json({ status: 'error', message: '缺少 url 参数' });
-  }
-  console.log('[callback] 更新回调 URL:', url);
+  if (!url) return res.json({ status: 'error', message: '缺少 url 参数' });
   try {
     await updateCallbackUrl(config, url, config.token, config.encodingAesKey);
     res.json({ status: 'ok', message: '回调 URL 已更新', url });
   } catch (err) {
-    console.error('[callback] 更新回调 URL 失败:', err.message);
     res.json({ status: 'error', message: err.message });
   }
 });
 
-// ===== pi 强制重启端点（watchdog 调用，不杀整个 bridge） =====
-app.post('/pi-restart', async (req, res) => {
-  console.log('[pi-restart] 收到外部重启请求');
-  if (piRestarting) {
-    return res.json({ status: 'already_restarting', message: 'pi 正在重启中，请稍候' });
+// ===== pi 强制重启端点（watchdog 调用） =====
+app.post('/pi-restart', express.json(), async (req, res) => {
+  const { userId } = req.body || {};
+  // 如果指定了 userId，只重启该用户的 pi
+  if (userId) {
+    const session = userSessions.get(userId);
+    if (session) {
+      session.stop();
+      try {
+        await session.start();
+        res.json({ status: 'ok', message: `pi for ${userId} 已重启`, pid: session.client?.proc?.pid });
+      } catch (err) {
+        res.json({ status: 'error', message: err.message });
+      }
+      return;
+    }
   }
-  try {
-    if (piClient) piClient.stop();
-    await new Promise(r => setTimeout(r, 1000));
-    await startPi({ isRestart: true });
-    res.json({ status: 'ok', message: 'pi 已重启', piPid: piClient?.proc?.pid });
-  } catch (err) {
-    res.json({ status: 'error', message: err.message });
+  // 否则重启所有用户会话
+  let count = 0;
+  for (const [uid, session] of userSessions) {
+    if (session.starting) continue;
+    session.stop();
+    try {
+      await session.start();
+      count++;
+    } catch {}
   }
+  res.json({ status: 'ok', message: `已重启 ${count}/${userSessions.size} 个会话` });
 });
+
+// ===== Tunnel 管理 =====
+let tunnelManager = null;
 
 // ===== 启动 =====
 async function main() {
@@ -610,6 +721,8 @@ async function main() {
   console.log(`   CorpID: ${config.corpId}`);
   console.log(`   AgentID: ${config.agentId}`);
   console.log(`   pi 工作目录: ${config.piCwd}`);
+  console.log(`   会话持久化: ${config.piNoSession ? '关闭' : '开启'}`);
+  console.log(`   空闲回收: ${config.piSessionIdleMs / 60000}min`);
   if (config.allowedUsers.length > 0) {
     console.log(`   允许的用户: ${config.allowedUsers.join(', ')}`);
   } else {
@@ -619,7 +732,7 @@ async function main() {
     console.log(`   管理员: ${config.adminUser}`);
   }
 
-  await startPi();
+  // 不再全局启动 pi — 改为 per-user 惰性启动
 
   app.listen(config.bridgePort, async () => {
     console.log(`\n✅ 桥接服务器已启动: http://localhost:${config.bridgePort}`);
@@ -629,21 +742,16 @@ async function main() {
     console.log(`   EncodingAESKey: ${config.encodingAesKey}`);
     console.log(`\n💡 健康检查: http://localhost:${config.bridgePort}/health`);
 
-    // 自动启动 cloudflared tunnel
     if (process.env.TUNNEL !== 'false') {
       try {
         await startTunnel();
       } catch (err) {
         console.error('⚠️ [tunnel] 启动失败:', err.message);
-        console.error('   bridge 仍可运行，但企业微信回调需要手动配置网络穿透');
       }
     }
   });
 }
 
-/**
- * 启动 cloudflared tunnel 并通知管理员新的回调 URL
- */
 async function startTunnel() {
   const logDir = process.env.TUNNEL_LOG_DIR || `${process.env.HOME}/logs/pi-wechat-bridge`;
 
@@ -655,7 +763,6 @@ async function startTunnel() {
       console.log(`\n🔗 Tunnel URL: ${newUrl}`);
       console.log(`   回调地址: ${callbackUrl}`);
 
-      // 通知管理员
       if (config.adminUser) {
         try {
           await sendMarkdownMessage(config, config.adminUser,
@@ -664,13 +771,9 @@ async function startTunnel() {
             `请前往[企业微信管理后台](https://work.weixin.qq.com/wework_admin/frame#apps)修改接收消息的 URL\n\n` +
             `> Token: \`${config.token}\`\n> EncodingAESKey: \`${config.encodingAesKey}\``
           );
-          console.log(`[tunnel] 已通知管理员 ${config.adminUser}`);
         } catch (err) {
           console.error('[tunnel] 通知管理员失败:', err.message);
         }
-      } else {
-        console.log('⚠️ [tunnel] 未配置 ADMIN_USER，无法自动通知');
-        console.log('   请设置 ADMIN_USER 环境变量（你的企业微信 UserID）');
       }
     },
   });
@@ -678,21 +781,18 @@ async function startTunnel() {
   await tunnelManager.start();
 }
 
-// 优雅退出（带超时保护，防止无限挂起）
 function gracefulShutdown(signal) {
   console.log(`\n🛑 收到 ${signal}，正在关闭...`);
-  const timer = setTimeout(() => {
-    console.error('[shutdown] 强制退出');
-    process.exit(1);
-  }, 10000);
+  const timer = setTimeout(() => { process.exit(1); }, 10000);
   timer.unref?.();
-  if (piClient) piClient.stop();
+
+  // 停止所有用户会话
+  for (const [, session] of userSessions) session.stop();
+  userSessions.clear();
+  if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
   if (tunnelManager) tunnelManager.stop();
-  // 给 stop 一点时间，然后退出
-  setTimeout(() => {
-    clearTimeout(timer);
-    process.exit(0);
-  }, 500);
+
+  setTimeout(() => { clearTimeout(timer); process.exit(0); }, 500);
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));

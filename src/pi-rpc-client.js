@@ -32,6 +32,7 @@ export class PiRpcClient {
     this.noExtensions = options.noExtensions || false;
     this.noSkills = options.noSkills || false;
     this.noContextFiles = options.noContextFiles || false;
+    this.appendSystemPrompt = options.appendSystemPrompt || '';
     this.proc = null;
     this.pendingRequests = new Map(); // id -> { resolve, reject, text, timer }
     this.eventHandlers = new Map(); // eventType -> handler[]
@@ -53,6 +54,7 @@ export class PiRpcClient {
       if (this.model) args.push('--model', this.model);
       if (this.thinking) args.push('--thinking', this.thinking);
       if (this.tools) args.push('--tools', this.tools);
+      if (this.appendSystemPrompt) args.push('--append-system-prompt', this.appendSystemPrompt);
 
       console.log(`[pi-rpc] 启动: ${this.piBin} ${args.join(' ')}`);
       console.log(`[pi-rpc] 工作目录: ${this.cwd}`);
