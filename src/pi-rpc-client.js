@@ -79,6 +79,9 @@ export class PiRpcClient {
           if (l.trim()) console.log(`[pi-rpc stderr] ${l}`);
         }
       });
+      this.proc.stderr.on('error', (err) => {
+        console.error('[pi-rpc] stderr 错误:', err.message);
+      });
 
       this.proc.on('error', (err) => {
         console.error('[pi-rpc] 进程启动失败:', err);
@@ -95,6 +98,8 @@ export class PiRpcClient {
           pending.reject(new Error('pi 进程已退出'));
         }
         this.pendingRequests.clear();
+        // 通知外部监听器
+        this._emit('exit', { code, signal });
       });
 
       // 等待 pi 就绪（收到第一个 extension_ui_request 或 2 秒超时）
@@ -224,8 +229,14 @@ export class PiRpcClient {
 
       this.pendingRequests.set(id, { resolve, reject, timer, text: '' });
 
-      this._sendCommand({ id, type: 'prompt', message });
-      console.log(`[pi-rpc] 已发送 prompt: ${message.slice(0, 80)}...`);
+      try {
+        this._sendCommand({ id, type: 'prompt', message });
+        console.log(`[pi-rpc] 已发送 prompt: ${message.slice(0, 80)}...`);
+      } catch (err) {
+        this.pendingRequests.delete(id);
+        clearTimeout(timer);
+        reject(err);
+      }
     });
   }
 
@@ -233,6 +244,10 @@ export class PiRpcClient {
    * 中止当前操作
    */
   abort() {
+    if (!this.proc || !this.proc.stdin.writable) {
+      console.warn('[pi-rpc] abort 被忽略：进程未运行');
+      return;
+    }
     this._sendCommand({ type: 'abort' });
   }
 
@@ -313,6 +328,16 @@ export class PiRpcClient {
   }
 
   /**
+   * 触发事件
+   */
+  _emit(eventType, data) {
+    const handlers = this.eventHandlers.get(eventType);
+    if (handlers) {
+      for (const h of handlers) h(data);
+    }
+  }
+
+  /**
    * JSONL 读取器
    */
   _attachJsonlReader(stream, onLine) {
@@ -334,6 +359,10 @@ export class PiRpcClient {
     stream.on('end', () => {
       buffer += decoder.end();
       if (buffer.trim()) onLine(buffer);
+    });
+
+    stream.on('error', (err) => {
+      console.error('[pi-rpc] stdout stream 错误:', err.message);
     });
   }
 

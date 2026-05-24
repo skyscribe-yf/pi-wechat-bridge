@@ -9,7 +9,7 @@
  *   node scripts/update-trusted-ip.js
  * 
  * 定时执行 (crontab):
- *   */30 * * * * cd /home/skyscribe/srcs/pi-wechat-bridge && node scripts/update-trusted-ip.js >> /tmp/ip-update.log 2>&1
+ *   0,30 * * * * cd /home/skyscribe/srcs/pi-wechat-bridge && node scripts/update-trusted-ip.js >> /tmp/ip-update.log 2>&1
  */
 
 import axios from 'axios';
@@ -76,6 +76,7 @@ async function main() {
   console.log('🔑 获取 access_token...');
   const tokenResp = await axios.get('https://qyapi.weixin.qq.com/cgi-bin/gettoken', {
     params: { corpid: corpId, corpsecret: secret },
+    timeout: 15000,
   });
 
   if (tokenResp.data.errcode !== 0) {
@@ -90,6 +91,7 @@ async function main() {
   console.log('📋 获取当前 IP 白名单...');
   const getResp = await axios.get('https://qyapi.weixin.qq.com/cgi-bin/get_allow_ips', {
     params: { access_token: token },
+    timeout: 15000,
   });
 
   if (getResp.data.errcode !== 0) {
@@ -105,6 +107,7 @@ async function main() {
   // 先获取当前应用设置
   const agentResp = await axios.get('https://qyapi.weixin.qq.com/cgi-bin/agent/get', {
     params: { access_token: token, agentid: Number(agentId) },
+    timeout: 15000,
   });
 
   if (agentResp.data.errcode !== 0) {
@@ -133,7 +136,8 @@ async function main() {
     {
       agentid: Number(agentId),
       allow_userip: newAllowIps,
-    }
+    },
+    { timeout: 15000 }
   );
 
   if (updateResp.data.errcode === 0) {

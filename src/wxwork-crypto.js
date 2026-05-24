@@ -91,6 +91,9 @@ export function decrypt(appId, encodingAesKey, encryptedText) {
   const content = unpadded.subarray(16);
   // 4 字节消息长度
   const msgLen = content.readUInt32BE(0);
+  if (msgLen > content.length - 4 || msgLen < 0) {
+    throw new Error('Invalid message length');
+  }
   // 提取消息明文
   const msg = content.subarray(4, 4 + msgLen).toString('utf8');
   // 提取 appId

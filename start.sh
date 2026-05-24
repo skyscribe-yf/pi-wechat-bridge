@@ -1,8 +1,15 @@
 #!/bin/bash
-# 启动 pi-wechat-bridge
+# 启动 pi-wechat-bridge，日志追加保存到 ~/logs/pi-wechat-bridge/
 set -e
 
+# 加载 nvm 环境
 cd "$(dirname "$0")"
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PATH="$HOME/.local/bin:$PATH"
+
+LOG_DIR="$HOME/logs/pi-wechat-bridge"
+mkdir -p "$LOG_DIR"
 
 # 检查 .env 是否存在
 if [ ! -f .env ]; then
@@ -40,5 +47,39 @@ if ! command -v pi &>/dev/null; then
   exit 1
 fi
 
+# 如果已有进程在跑，先杀掉
+OLD_PID=$(lsof -t -i:3100 2>/dev/null || true)
+if [ -n "$OLD_PID" ]; then
+  echo "🛑 发现已有进程 (PID: $OLD_PID)，正在停止..."
+  kill $OLD_PID 2>/dev/null || true
+  sleep 2
+fi
+
+# 日志轮转（超过 50MB 时备份）
+LOG_FILE="$LOG_DIR/bridge.log"
+if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+  mv "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d%H%M%S).old"
+fi
+
 echo "🚀 启动 pi-wechat-bridge..."
-exec node src/server.js
+echo "   日志文件: $LOG_FILE (追加模式)"
+echo ""
+
+# 启动，日志追加写入（>> 确保重启不覆盖）
+nohup node src/server.js >> "$LOG_FILE" 2>&1 &
+BRIDGE_PID=$!
+echo "   PID: $BRIDGE_PID"
+
+# 等待启动
+sleep 5
+
+# 检查是否成功
+if kill -0 $BRIDGE_PID 2>/dev/null; then
+  echo "✅ 已启动！"
+  echo ""
+  echo "📋 查看日志: tail -f $LOG_DIR/bridge.log"
+  echo "💡 健康检查: curl http://localhost:3100/health"
+else
+  echo "❌ 启动失败，查看日志: cat $LOG_DIR/bridge.log"
+  exit 1
+fi

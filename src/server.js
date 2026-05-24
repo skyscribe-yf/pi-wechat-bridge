@@ -11,6 +11,17 @@ import { PiRpcClient } from './pi-rpc-client.js';
 
 dotenv.config();
 
+// ===== 全局错误处理 =====
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] 未捕获的异常:', err);
+  // 给日志 flush 一点时间，然后退出
+  setTimeout(() => process.exit(1), 500);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[fatal] 未处理的 Promise 拒绝:', reason);
+});
+
 // ===== 配置 =====
 const config = {
   corpId: process.env.WXWORK_CORP_ID,
@@ -44,19 +55,41 @@ if (missing.length > 0) {
 // ===== pi RPC 客户端 =====
 let piClient = null;
 let isPiBusy = false;
+let busyTimer = null;
 
-async function startPi() {
-  piClient = new PiRpcClient({
-    cwd: config.piCwd,
-    provider: config.piProvider,
-    model: config.piModel,
-    thinking: config.piThinking,
-    tools: config.piTools,
-    noSession: config.piNoSession,
-    noExtensions: config.piNoExtensions,
-    noSkills: config.piNoSkills,
-    noContextFiles: config.piNoContextFiles,
-  });
+async function startPi({ isRestart = false } = {}) {
+  const createClient = () => {
+    const client = new PiRpcClient({
+      cwd: config.piCwd,
+      provider: config.piProvider,
+      model: config.piModel,
+      thinking: config.piThinking,
+      tools: config.piTools,
+      noSession: config.piNoSession,
+      noExtensions: config.piNoExtensions,
+      noSkills: config.piNoSkills,
+      noContextFiles: config.piNoContextFiles,
+    });
+
+    // 监听进程退出，自动重启
+    client.on('exit', async ({ code }) => {
+      console.warn(`[pi-rpc] 进程退出 (code=${code})，5 秒后自动重启...`);
+      isPiBusy = false;
+      if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        await startPi({ isRestart: true });
+        console.log('✅ pi RPC 已自动重启');
+      } catch (err) {
+        console.error('❌ pi RPC 自动重启失败:', err.message);
+        // 重启失败不退出进程，保持运行等待下次重试或 watchdog
+      }
+    });
+
+    return client;
+  };
+
+  piClient = createClient();
 
   try {
     await piClient.start();
@@ -65,7 +98,10 @@ async function startPi() {
     console.error('❌ pi RPC 启动失败:', err.message);
     console.error('请确保 pi 已安装 (npm install -g @earendil-works/pi-coding-agent)');
     console.error('并且 ANTHROPIC_API_KEY 或其他 provider 的 API key 已设置');
-    process.exit(1);
+    if (!isRestart) {
+      process.exit(1);
+    }
+    throw err; // 让调用方（exit handler）的 catch 能捕获到
   }
 }
 
@@ -157,13 +193,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  // 检查 pi 是否繁忙
-  if (isPiBusy) {
-    await sendTextMessage(config, userId, '⏳ pi 正在处理之前的请求，请稍后再发送新消息。');
-    return;
-  }
-
-  // 特殊命令
+  // 特殊命令（不占用 pi 的并发锁）
   if (content === '/help') {
     await sendTextMessage(config, userId,
       '🤖 pi Agent 微信 Bot 命令\n\n' +
@@ -180,26 +210,63 @@ async function handleMessage(msg) {
       '  /status             查看状态\n' +
       '  /models             列出模型\n' +
       '  /abort              中止操作\n' +
+      '  /reset              强制重置(卡住时用)\n' +
       '  /help               帮助');
     return;
   }
 
-  if (content === '/abort') {
-    if (piClient) piClient.abort();
+  // /reset 命令 - 强制重置繁忙状态（任何时候都可执行）
+  if (content === '/reset') {
     isPiBusy = false;
+    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
+    if (piClient && !piClient.proc) {
+      // pi 进程挂了，重启
+      await sendTextMessage(config, userId, '🔄 pi 进程已退出，正在重启...');
+      try {
+        await startPi();
+        await sendTextMessage(config, userId, '✅ pi 已重启，状态已重置');
+      } catch (err) {
+        await sendTextMessage(config, userId, `❌ 重启失败: ${err.message}`);
+      }
+    } else {
+      await sendTextMessage(config, userId, '✅ 状态已重置，可以继续发消息了');
+    }
+    return;
+  }
+
+  // /abort 命令 - 任何时候都可执行
+  if (content === '/abort') {
+    if (piClient && piClient.proc) piClient.abort();
+    isPiBusy = false;
+    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
     await sendTextMessage(config, userId, '✅ 已中止当前操作。');
     return;
   }
 
+  // 检查 pi 是否繁忙（在可能占用 pi 的操作之前统一检查）
+  if (isPiBusy) {
+    await sendTextMessage(config, userId, '⏳ pi 正在处理之前的请求，请稍后再发送新消息。');
+    return;
+  }
+
+  // 从这一刻起占用并发锁，防止后续命令与 pi prompt 发生竞态
+  isPiBusy = true;
+
   if (content === '/status') {
-    const state = await piClient.getState();
-    await sendTextMessage(config, userId,
-      `📊 pi 状态:\n` +
-      `- 模型: ${state?.model?.name || '未知'} (${state?.model?.provider || '?'})\n` +
-      `- 模型ID: ${state?.model?.id || '未知'}\n` +
-      `- 思考等级: ${state?.thinkingLevel || '未知'}\n` +
-      `- 是否正在处理: ${state?.isStreaming ? '是' : '否'}\n` +
-      `- 会话消息数: ${state?.messageCount || 0}`);
+    try {
+      const state = await piClient.getState();
+      await sendTextMessage(config, userId,
+        `📊 pi 状态:\n` +
+        `- 模型: ${state?.model?.name || '未知'} (${state?.model?.provider || '?'})\n` +
+        `- 模型ID: ${state?.model?.id || '未知'}\n` +
+        `- 思考等级: ${state?.thinkingLevel || '未知'}\n` +
+        `- 是否正在处理: ${state?.isStreaming ? '是' : '否'}\n` +
+        `- 会话消息数: ${state?.messageCount || 0}`);
+    } catch (err) {
+      await sendTextMessage(config, userId, `❌ 获取状态失败: ${err.message}`);
+    } finally {
+      isPiBusy = false;
+    }
     return;
   }
 
@@ -270,6 +337,8 @@ async function handleMessage(msg) {
       await sendTextMessage(config, userId, `✅ 已切换到 ${modelName}${listLink}`);
     } catch (err) {
       await sendTextMessage(config, userId, `❌ 切换失败: ${err.message}\n试试发 /models 查看可用模型`);
+    } finally {
+      isPiBusy = false;
     }
     return;
   }
@@ -301,6 +370,8 @@ async function handleMessage(msg) {
       await sendTextMessage(config, userId, text);
     } catch (err) {
       await sendTextMessage(config, userId, `❌ 获取列表失败: ${err.message}`);
+    } finally {
+      isPiBusy = false;
     }
     return;
   }
@@ -310,6 +381,7 @@ async function handleMessage(msg) {
     const level = content.slice(10).trim();
     const validLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
     if (!validLevels.includes(level)) {
+      isPiBusy = false;
       await sendTextMessage(config, userId,
         '⚠️ 等级: off, minimal, low, medium, high, xhigh');
       return;
@@ -319,12 +391,21 @@ async function handleMessage(msg) {
       await sendTextMessage(config, userId, `✅ 思考等级已设为: ${level}`);
     } catch (err) {
       await sendTextMessage(config, userId, `❌ 设置失败: ${err.message}`);
+    } finally {
+      isPiBusy = false;
     }
     return;
   }
 
   // 发送给 pi 处理
-  isPiBusy = true;
+  // 安全超时：5 分钟后自动解除繁忙状态
+  busyTimer = setTimeout(() => {
+    if (isPiBusy) {
+      console.warn('[msg] ⚠️ pi 处理超时 (5min)，自动重置繁忙状态');
+      isPiBusy = false;
+      busyTimer = null;
+    }
+  }, 300000);
   try {
     // 先回复"正在处理"
     await sendTextMessage(config, userId, '🤔 正在思考中...');
@@ -359,6 +440,7 @@ async function handleMessage(msg) {
     await sendTextMessage(config, userId, `❌ 处理失败: ${err.message}`);
   } finally {
     isPiBusy = false;
+    if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
   }
 }
 
@@ -397,18 +479,24 @@ async function main() {
   });
 }
 
-// 优雅退出
-process.on('SIGINT', () => {
-  console.log('\n🛑 正在关闭...');
+// 优雅退出（带超时保护，防止无限挂起）
+function gracefulShutdown(signal) {
+  console.log(`\n🛑 收到 ${signal}，正在关闭...`);
+  const timer = setTimeout(() => {
+    console.error('[shutdown] 强制退出');
+    process.exit(1);
+  }, 10000);
+  timer.unref?.();
   if (piClient) piClient.stop();
-  process.exit(0);
-});
+  // 给 stop 一点时间，然后退出
+  setTimeout(() => {
+    clearTimeout(timer);
+    process.exit(0);
+  }, 500);
+}
 
-process.on('SIGTERM', () => {
-  console.log('\n🛑 正在关闭...');
-  if (piClient) piClient.stop();
-  process.exit(0);
-});
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 main().catch(err => {
   console.error('💥 启动失败:', err);

@@ -24,6 +24,7 @@ export async function getAccessToken(corpId, secret) {
   const url = `${BASE_URL}/gettoken`;
   const resp = await axios.get(url, {
     params: { corpid: corpId, corpsecret: secret },
+    timeout: 15000,
   });
 
   if (resp.data.errcode !== 0) {
@@ -58,6 +59,7 @@ export async function sendTextMessage(config, userId, content) {
     text: { content },
   }, {
     params: { access_token: token },
+    timeout: 15000,
   });
 
   if (resp.data.errcode !== 0) {
@@ -83,6 +85,7 @@ export async function sendMarkdownMessage(config, userId, content) {
     markdown: { content },
   }, {
     params: { access_token: token },
+    timeout: 15000,
   });
 
   if (resp.data.errcode !== 0) {

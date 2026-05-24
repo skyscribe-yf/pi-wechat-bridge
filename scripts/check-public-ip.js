@@ -9,7 +9,7 @@
  *   node scripts/check-public-ip.js
  *
  * 定时执行 (crontab):
- *   */30 * * * * cd /home/skyscribe/srcs/pi-wechat-bridge && node scripts/check-public-ip.js
+ *   crontab: 每30分钟运行一次
  */
 
 import axios from 'axios';
@@ -69,4 +69,7 @@ async function main() {
   console.log('');
 }
 
-main();
+main().catch(err => {
+  console.error('[check-ip] 脚本出错:', err.message);
+  process.exit(1);
+});
