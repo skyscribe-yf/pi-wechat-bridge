@@ -49,10 +49,18 @@ export class PiRpcClient {
       console.log(`[pi-rpc] 启动: ${this.piBin} ${args.join(' ')}`);
       console.log(`[pi-rpc] 工作目录: ${this.cwd}`);
 
+      // 过滤敏感环境变量，防止企业微信配置泄露给 pi 子进程
+      const safeEnv = { ...process.env };
+      delete safeEnv.WXWORK_SECRET;
+      delete safeEnv.WXWORK_TOKEN;
+      delete safeEnv.WXWORK_ENCODING_AES_KEY;
+      delete safeEnv.WXWORK_CORP_ID;
+      delete safeEnv.WXWORK_AGENT_ID;
+
       this.proc = spawn(this.piBin, args, {
         cwd: this.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: safeEnv,
       });
 
       this.proc.stdin.on('error', (err) => {

@@ -421,6 +421,12 @@ async function handleMessage(msg) {
 
     const reply = await piClient.prompt(content, 300000);
 
+    // pi 有时返回空响应，给用户友好提示
+    if (!reply || reply === '(无回复)') {
+      await safeSend(config, userId, '🤔 pi 没有返回内容，可能是当前任务不需要文字回复，或者处理中遇到了问题。你可以继续发送消息。');
+      return;
+    }
+
     // pi 的回复可能很长，企业微信单条消息有长度限制 (2048 字符)
     // 如果超过限制，分段发送
     const MAX_LEN = 2000;

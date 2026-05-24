@@ -8,6 +8,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "express": "^4.21.0",
     "axios": "^1.7.0",
