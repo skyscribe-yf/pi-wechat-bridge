@@ -1,14 +1,23 @@
 # pi-wechat-bridge
 
-将 [pi coding agent](https://pi.dev) 连接到企业微信，让你可以在微信中直接与 pi 对话、控制代码编辑等。
+将 [pi coding agent](https://pi.dev) 连接到企业微信，让你可以在微信中直接与 pi 对话、远程指挥代码编辑。
 
 ## 架构
 
 ```
-微信 App ←→ 企业微信服务器 ←→ pi-wechat-bridge ←→ pi (RPC mode)
+微信 App ←→ 企业微信服务器 ←→ pi-wechat-bridge ←→ pi (RPC mode, per-user)
                                       ↓
                                你的代码项目目录
 ```
+
+**核心特性：**
+
+- **Per-User 会话** — 每个用户独立 pi 进程，互不干扰
+- **会话持久化** — 同一用户多轮对话共享上下文，pi 记得你说过什么
+- **活动感知超时** — pi 有产出就续期，不会提前杀掉长任务
+- **Markdown 渲染** — 代码块、diff、粗体等在企业微信中友好显示
+- **多段输入** — `/begin` / `/end` 合并长消息，突破微信单条字数限制
+- **流式输出** — 实时推送 pi 的思考、工具调用、文本增量
 
 ## 前置条件
 
@@ -67,9 +76,20 @@ WXWORK_ENCODING_AES_KEY=你获取的EncodingAESKey
 
 # pi 配置
 PI_CWD=/home/user/my-project     # pi 工作目录
-PI_PROVIDER=anthropic             # 可选，指定 provider
-PI_MODEL=claude-sonnet-4          # 可选，指定模型
-PI_THINKING=medium                # 思考等级
+# PI_PROVIDER=anthropic          # 可选，指定 provider
+# PI_MODEL=claude-sonnet-4       # 可选，指定模型
+PI_THINKING=medium               # 思考等级
+
+# 会话管理（可选）
+# PI_NO_SESSION=true             # 设 true 关闭会话持久化
+# PI_SESSION_IDLE_MS=1800000     # 空闲回收阈值（默认 30min）
+# PI_APPEND_SYSTEM_PROMPT=当修改代码时，请用 diff 格式展示变更
+
+# 管理员（可选，用于管理员命令）
+# ADMIN_USER=your-user-id
+
+# 安全
+# ALLOWED_USERS=user1,user2      # 允许的用户 UserID
 ```
 
 ### 第 5 步：启动服务器
@@ -84,75 +104,156 @@ npm start
 
 在企业微信 App 中找到你创建的应用，直接发消息即可！
 
-## 使用方法
+## Bot 命令
 
-在微信中直接发送任何文本，pi 会处理你的请求并回复。
-
-### 特殊命令
+### 普通用户命令
 
 | 命令 | 说明 |
 |------|------|
-| `/stream on\|off\|status` | 流式模式开关（实时推送 pi 中间产出，默认关闭） |
-| `/abort` | 中止 pi 当前操作 |
-| `/status` | 查看 pi 当前状态 |
+| 直接发消息 | pi 处理并回复（上下文连续，pi 记得之前对话） |
+| `/begin` ... `/end` | 多段输入合并为一条长 prompt |
+| `/model <名称>` | 切换模型（支持别名和 `provider/id` 格式） |
+| `/thinking <等级>` | 设置思考等级：off / minimal / low / medium / high / xhigh |
+| `/stream on\|off\|status` | 流式模式（实时推送 pi 中间产出） |
+| `/clear` | 清除自己的会话上下文 |
+| `/status` | 查看自己的会话状态 |
+| `/models` | 列出可用模型 |
+| `/abort` | 中止自己的当前操作 |
+| `/help` | 显示帮助 |
 
-### 示例对话
+### 管理员命令
+
+管理员是 `.env` 中 `ADMIN_USER` 指定的用户（默认取 `ALLOWED_USERS` 的第一个）。
+
+| 命令 | 说明 |
+|------|------|
+| `/sessions` | 查看所有活跃会话（含 PID、空闲时间、busy 状态） |
+| `/clear <userId>` | 清除指定用户的会话 |
+| `/clear-all` | 清除所有会话 |
+
+### 自然语言模型切换
+
+除了 `/model` 命令，还支持中文自然语言：
+
+- "切换到 deepseek"
+- "用 kimi"
+- "换讯飞"
+- "切到 mimo"
+- "用 claude"
+
+### 多段输入示例
+
+微信单条消息约 2048 字符，长代码或复杂指令可以用多段输入：
 
 ```
-你: 在 src/utils.ts 中添加一个日期格式化函数
-
-pi: 我来帮你在 src/utils.ts 中添加日期格式化函数...
-
-  1. 读取了 src/utils.ts 文件
-  2. 在文件末尾添加了 formatDate 函数
-  3. 确认函数导出正常
-
-  添加的函数如下:
-  export function formatDate(date: Date, format: string = 'YYYY-MM-DD'): string {
-    // ... 实现
-  }
+你: /begin
+Bot: 📝 开始多段输入，以 /end 结束
+你: 把 server.js 里的端口改成 3200，
+你: 并且在 health 端点加上内存使用信息，
+你: 最后更新 AGENTS.md 里的端口说明
+你: /end
+Bot: 📝 已合并 3 段输入，开始处理...
 ```
+
+### 流式模式
+
+开启后实时推送 pi 的中间产出：
+
+```
+你: /stream on
+Bot: ✅ 流式模式已开启
+
+你: 看看 src/server.js 有什么问题
+Bot: 🤔 思考中... (流式)
+Bot: 💭 让我检查一下这个文件的结构...
+Bot: 🔧 read: src/server.js
+Bot: 发现几个可以改进的地方：
+Bot: 1. 端口硬编码 → 应该用环境变量
+Bot: 2. 缺少错误处理中间件
+Bot: ...
+```
+
+## 会话管理
+
+### 上下文连续
+
+默认 `PI_NO_SESSION=false`，同一用户的多轮对话共享 pi 进程上下文。pi 能记住你之前让它做的事情：
+
+```
+你: 在 utils.ts 里加一个 formatDate 函数
+Bot: ✅ 已添加 formatDate 函数...
+
+你: 现在让它支持中文日期格式
+Bot: ✅ 已更新 formatDate 函数，添加了中文日期支持...
+    (pi 记得上面加的函数，无需重新描述)
+```
+
+### 清除会话
+
+```
+你: /clear
+Bot: 🧹 会话已清除，下次发消息将创建新会话
+```
+
+这会杀掉当前 pi 进程，下次发消息时自动创建新的。
+
+### 自动回收
+
+空闲超过 30 分钟（`PI_SESSION_IDLE_MS`）的会话自动回收，释放 pi 进程占用的资源。下次发消息时自动重建。
+
+### 进程崩溃
+
+pi 进程意外退出时自动重启（2 秒后），会话上下文不保留。
+
+## 环境变量参考
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `WXWORK_CORP_ID` | ✅ | — | 企业微信 CorpID |
+| `WXWORK_AGENT_ID` | ✅ | — | 自建应用 AgentId |
+| `WXWORK_SECRET` | ✅ | — | 自建应用 Secret |
+| `WXWORK_TOKEN` | ✅ | — | 消息接收 Token |
+| `WXWORK_ENCODING_AES_KEY` | ✅ | — | 消息加密密钥 |
+| `PI_CWD` | ❌ | `process.cwd()` | pi 工作目录 |
+| `PI_PROVIDER` | ❌ | pi 默认 | LLM provider |
+| `PI_MODEL` | ❌ | pi 默认 | 模型 ID |
+| `PI_THINKING` | ❌ | `medium` | 思考等级 |
+| `PI_TOOLS` | ❌ | `read,bash,edit,write,grep,find,ls` | 允许的工具列表 |
+| `PI_NO_SESSION` | ❌ | `false` | 设 `true` 关闭会话持久化 |
+| `PI_APPEND_SYSTEM_PROMPT` | ❌ | — | 追加 system prompt |
+| `PI_SESSION_IDLE_MS` | ❌ | `1800000` | 空闲回收阈值（30min） |
+| `PI_BIN_PATH` | ❌ | `pi` | pi 可执行文件路径 |
+| `BRIDGE_PORT` | ❌ | `3100` | 桥接服务器端口 |
+| `ALLOWED_USERS` | ❌ | 全部允许 | 允许的用户 UserID（逗号分隔） |
+| `ADMIN_USER` | ❌ | ALLOWED_USERS 首项 | 管理员用户 ID |
+| `TUNNEL` | ❌ | `true` | 设 `false` 不自动启动 cloudflared |
 
 ## WSL2 网络穿透
 
-如果你的 bridge 运行在 WSL2 中，企业微信服务器无法直接访问 WSL2 内部的端口。解决方案：
+如果你的 bridge 运行在 WSL2 中，企业微信服务器无法直接访问 WSL2 内部端口：
 
-### 方案 A：Windows 端口转发（推荐）
-
-在 Windows PowerShell（管理员）中运行：
+### 方案 A：Windows 端口转发
 
 ```powershell
-# 获取 WSL2 的 IP
+# PowerShell (管理员)
 wsl hostname -I
-
-# 添加端口转发（替换 WSL_IP 为上一步的输出）
 netsh interface portproxy add v4tov4 listenport=3100 listenaddress=0.0.0.0 connectport=3100 connectaddress=WSL_IP
-
-# 添加防火墙规则
 netsh advfirewall firewall add rule name="pi-wechat-bridge" dir=in action=allow protocol=TCP localport=3100
-
-# 查看已添加的规则
-netsh interface portproxy show all
 ```
 
-> ⚠️ WSL2 重启后 IP 可能变化，需要更新端口转发规则。
-
-### 方案 B：使用 ngrok / cloudflared
+### 方案 B：cloudflared / ngrok
 
 ```bash
-# 使用 cloudflared
 cloudflared tunnel --url http://localhost:3100
-
-# 使用 ngrok
+# 或
 ngrok http 3100
 ```
 
-然后把生成的公网 URL 配置到企业微信回调地址中。
+bridge 启动时会自动尝试 cloudflared tunnel（`TUNNEL=false` 可关闭）。
 
-### 方案 C：systemd 服务（开机自启）
+### 方案 C：systemd 服务
 
 ```bash
-# 创建 systemd 服务文件
 sudo tee /etc/systemd/system/pi-wechat-bridge.service << 'EOF'
 [Unit]
 Description=pi-wechat-bridge
@@ -177,17 +278,21 @@ sudo systemctl start pi-wechat-bridge
 
 ## 安全建议
 
-1. **设置 ALLOWED_USERS**：限制可以使用 Bot 的企业微信用户
-2. **pi 工具权限**：默认只启用安全工具（read, bash, edit, write），根据需要调整 PI_TOOLS
-3. **不要暴露 Secret**：.env 文件不要提交到 Git
-4. **网络隔离**：建议通过反向代理（nginx）暴露服务，添加 HTTPS
+1. **设置 ALLOWED_USERS** — 限制可使用 Bot 的用户
+2. **设置 ADMIN_USER** — 管理员可执行特权命令
+3. **pi 工具权限** — 默认只启用安全工具，按需调整 `PI_TOOLS`
+4. **不要提交 .env** — 已包含在 `.gitignore`
+5. **企业微信凭据隔离** — Secret/Token/AESKey 不会注入 pi 子进程
+6. **HTTPS** — 生产环境建议 nginx 反向代理 + TLS
 
 ## 故障排除
 
 | 问题 | 解决方案 |
 |------|---------|
 | 回调验证失败 | 检查 Token 和 EncodingAESKey 是否与 .env 一致 |
-| pi 启动失败 | 确保设置了 API key (如 ANTHROPIC_API_KEY) |
-| 企业微信收不到回复 | 检查 access_token 是否正常获取，查看服务器日志 |
+| pi 启动失败 | 确保设置了 API key，检查 `PI_BIN_PATH` 是否正确 |
+| 企业微信收不到回复 | 检查 access_token 日志，确认网络可达 |
 | WSL2 外部无法访问 | 检查端口转发和防火墙规则 |
-| pi 响应超时 | 默认超时 5 分钟，可在代码中调整 |
+| pi 响应超时 | 活动感知超时：2 分钟静默释放锁，10 分钟硬上限 |
+| 会话卡住 | 发 `/abort` 或 `/clear`，管理员可用 `/clear <userId>` |
+| 多用户同时用不了 | 每用户独立 pi 进程，不应互相阻塞（如遇问题报 bug） |

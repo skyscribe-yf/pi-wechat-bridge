@@ -300,7 +300,8 @@ async function handleMessage(msg) {
 
   // ===== /help =====
   if (content === '/help') {
-    await safeSend(config, userId,
+    const isAdmin = config.adminUser && userId === config.adminUser;
+    let helpText =
       '🤖 pi Agent 微信 Bot 命令\n\n' +
       '💬 直接发消息 → pi 处理并回复（上下文连续）\n\n' +
       '📝 多段输入:\n' +
@@ -313,11 +314,19 @@ async function handleMessage(msg) {
       '  /model deepseek     切换模型\n' +
       '  /thinking high      思考等级\n' +
       '  /stream on|off      流式模式开关\n' +
-      '  /clear              清除会话上下文\n' +
-      '  /status             查看状态\n' +
+      '  /clear              清除自己的会话\n' +
+      '  /status             查看自己的状态\n' +
       '  /models             列出模型\n' +
       '  /abort              中止操作\n' +
-      '  /help               帮助');
+      '  /help               帮助';
+    if (isAdmin) {
+      helpText +=
+        '\n\n👑 管理员命令:\n' +
+        '  /sessions           查看所有活跃会话\n' +
+        '  /clear <userId>     清除指定用户会话\n' +
+        '  /clear-all          清除所有会话';
+    }
+    await safeSend(config, userId, helpText);
     return;
   }
 
@@ -363,7 +372,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  // ===== /clear — 清除会话上下文 =====
+  // ===== /clear — 清除当前会话上下文 =====
   if (content === '/clear') {
     const session = userSessions.get(userId);
     if (session) {
@@ -373,6 +382,65 @@ async function handleMessage(msg) {
     } else {
       await safeSend(config, userId, 'ℹ️ 当前没有活跃会话');
     }
+    return;
+  }
+
+  // 非管理员尝试管理员命令
+  const isAdmin = config.adminUser && userId === config.adminUser;
+  const clearUserMatch = content.match(/^\/clear\s+(\S+)$/);
+  if (!isAdmin && (content === '/sessions' || content === '/clear-all' || clearUserMatch)) {
+    await safeSend(config, userId, '⛔ 此命令仅限管理员使用');
+    return;
+  }
+
+  // /sessions — 查看所有活跃会话
+  if (content === '/sessions' && isAdmin) {
+    if (userSessions.size === 0) {
+      await safeSend(config, userId, '📋 当前没有活跃会话');
+      return;
+    }
+    const lines = [`📋 活跃会话 (${userSessions.size}):`];
+    let i = 0;
+    for (const [uid, session] of userSessions) {
+      i++;
+      const alive = session.isAlive() ? '✅' : '❌';
+      const busy = session.busy ? '⏳' : '💤';
+      const idleMin = Math.round((Date.now() - session.lastActive) / 60000);
+      const pid = session.client?.proc?.pid || '-';
+      lines.push(`${i}. \`${uid}\` ${alive}${busy} PID:${pid} 空闲:${idleMin}min`);
+    }
+    lines.push('', '管理员命令:');
+    lines.push('  `/clear <userId>` 清除指定用户会话');
+    lines.push('  `/clear-all`      清除所有会话');
+    await safeSend(config, userId, lines.join('\n'));
+    return;
+  }
+
+  // /clear <userId> — 管理员清除指定用户会话
+  if (clearUserMatch && isAdmin) {
+    const targetUserId = clearUserMatch[1];
+    const session = userSessions.get(targetUserId);
+    if (session) {
+      session.stop();
+      userSessions.delete(targetUserId);
+      await safeSend(config, userId, `🧹 已清除用户 \`${targetUserId}\` 的会话`);
+    } else {
+      await safeSend(config, userId, `ℹ️ 用户 \`${targetUserId}\` 没有活跃会话`);
+    }
+    return;
+  }
+
+  // /clear-all — 管理员清除所有会话
+  if (content === '/clear-all' && isAdmin) {
+    const count = userSessions.size;
+    if (count === 0) {
+      await safeSend(config, userId, 'ℹ️ 当前没有活跃会话');
+      return;
+    }
+    for (const [, session] of userSessions) session.stop();
+    userSessions.clear();
+    if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
+    await safeSend(config, userId, `🧹 已清除所有 ${count} 个会话`);
     return;
   }
 
