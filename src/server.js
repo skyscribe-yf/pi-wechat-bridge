@@ -6,7 +6,8 @@ import express from 'express';
 import { parseStringPromise } from 'xml2js';
 import dotenv from 'dotenv';
 import { encrypt, decrypt, verifySignature } from './wxwork-crypto.js';
-import { sendTextMessage, sendMarkdownMessage } from './wxwork-api.js';
+import { sendTextMessage, sendMarkdownMessage, updateCallbackUrl } from './wxwork-api.js';
+import { TunnelManager } from './tunnel.js';
 
 // 安全发送消息：失败时记录日志但不抛异常，避免影响主流程
 async function safeSend(config, userId, text) {
@@ -17,6 +18,7 @@ async function safeSend(config, userId, text) {
   }
 }
 import { PiRpcClient } from './pi-rpc-client.js';
+import { StreamBuffer } from './stream-buffer.js';
 
 dotenv.config();
 
@@ -49,6 +51,7 @@ const config = {
   piNoExtensions: process.env.PI_NO_EXTENSIONS === 'true',
   piNoSkills: process.env.PI_NO_SKILLS === 'true',
   piNoContextFiles: process.env.PI_NO_CONTEXT_FILES === 'true',
+  adminUser: process.env.ADMIN_USER || process.env.ALLOWED_USERS?.split(',')[0]?.trim() || '',
 };
 
 // ===== 验证必需配置 =====
@@ -61,14 +64,34 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-// ===== pi RPC 客户端 =====
-let piClient = null;
-let isPiBusy = false;
-let busyTimer = null;
+  // ===== pi RPC 客户端 =====
+  let piClient = null;
+  let isPiBusy = false;
+  let busyTimer = null;
+  let piRestarting = false; // 标记 pi 正在自动重启中，health 端点用
+
+// ===== Tunnel 管理 =====
+let tunnelManager = null;
+
+// ===== 流式状态（按用户 opt-in） =====
+/** @type {Map<string, boolean>} userId -> streaming enabled */
+const userStreamEnabled = new Map();
+/** 当前活跃的 StreamBuffer（用于 /abort）。受 isPiBusy 单租约束。*/
+let activeStreamBuffer = null;
+
+function isStreamingEnabledFor(userId) {
+  return userStreamEnabled.get(userId) === true;
+}
+
+function setStreamingEnabledFor(userId, enabled) {
+  if (enabled) userStreamEnabled.set(userId, true);
+  else userStreamEnabled.delete(userId);
+}
 
 async function startPi({ isRestart = false } = {}) {
   const createClient = () => {
     const client = new PiRpcClient({
+      piBin: process.env.PI_BIN_PATH || 'pi',
       cwd: config.piCwd,
       provider: config.piProvider,
       model: config.piModel,
@@ -82,16 +105,18 @@ async function startPi({ isRestart = false } = {}) {
 
     // 监听进程退出，自动重启
     client.on('exit', async ({ code }) => {
-      console.warn(`[pi-rpc] 进程退出 (code=${code})，5 秒后自动重启...`);
+      console.warn(`[pi-rpc] 进程退出 (code=${code})，2 秒后自动重启...`);
       isPiBusy = false;
+      piRestarting = true;
       if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(r => setTimeout(r, 2000));
       try {
         await startPi({ isRestart: true });
         console.log('✅ pi RPC 已自动重启');
       } catch (err) {
         console.error('❌ pi RPC 自动重启失败:', err.message);
-        // 重启失败不退出进程，保持运行等待下次重试或 watchdog
+      } finally {
+        piRestarting = false;
       }
     });
 
@@ -216,11 +241,32 @@ async function handleMessage(msg) {
       '⌨️ 文字命令:\n' +
       '  /model deepseek     切换模型\n' +
       '  /thinking high      思考等级\n' +
+      '  /stream on|off      流式模式开关\n' +
       '  /status             查看状态\n' +
       '  /models             列出模型\n' +
       '  /abort              中止操作\n' +
       '  /reset              强制重置(卡住时用)\n' +
       '  /help               帮助');
+    return;
+  }
+
+  // /stream on|off|status —— 每用户独立开关
+  if (content === '/stream' || content.startsWith('/stream ')) {
+    const arg = content === '/stream' ? 'status' : content.slice(8).trim().toLowerCase();
+    if (arg === 'on') {
+      setStreamingEnabledFor(userId, true);
+      await safeSend(config, userId, '✅ 流式模式已开启 (实时推送 pi 的中间产出)');
+    } else if (arg === 'off') {
+      setStreamingEnabledFor(userId, false);
+      await safeSend(config, userId, '✅ 流式模式已关闭');
+    } else if (arg === 'status' || arg === '') {
+      const on = isStreamingEnabledFor(userId);
+      await safeSend(config, userId,
+        `📡 流式模式: ${on ? '开启' : '关闭'}\n` +
+        '用法: /stream on | /stream off | /stream status');
+    } else {
+      await safeSend(config, userId, '⚠️ 用法: /stream on | /stream off | /stream status');
+    }
     return;
   }
 
@@ -246,6 +292,11 @@ async function handleMessage(msg) {
   // /abort 命令 - 任何时候都可执行
   if (content === '/abort') {
     if (piClient && piClient.proc) piClient.abort();
+    if (activeStreamBuffer) {
+      try { await activeStreamBuffer.abort(); }
+      catch (e) { console.error('[stream] abort 错误:', e?.message || e); }
+      activeStreamBuffer = null;
+    }
     isPiBusy = false;
     if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
     await safeSend(config, userId, '✅ 已中止当前操作。');
@@ -415,58 +466,141 @@ async function handleMessage(msg) {
       busyTimer = null;
     }
   }, 300000);
+
+  const streaming = isStreamingEnabledFor(userId);
+  let buffer = null;
+  let streamedAnyText = false;
+
   try {
     // 先回复"正在处理"
-    await safeSend(config, userId, '🤔 正在思考中...');
+    await safeSend(config, userId, streaming ? '🤔 思考中... (流式)' : '🤔 正在思考中...');
 
-    const reply = await piClient.prompt(content, 300000);
+    let promptArg = 300000;
+    if (streaming) {
+      buffer = new StreamBuffer({
+        send: (text) => safeSend(config, userId, text),
+        logger: console.log,
+      });
+      activeStreamBuffer = buffer;
+      promptArg = {
+        timeout: 300000,
+        onProgress: (event) => {
+          if (event.type === 'text_delta') streamedAnyText = true;
+          buffer.handle(event);
+        },
+      };
+    }
 
-    // pi 有时返回空响应，给用户友好提示
+    const reply = await piClient.prompt(content, promptArg);
+
+    if (streaming) {
+      // flush 任何残留的 buffer（最后一段文字 + thinking）
+      await buffer.finalize();
+      if (activeStreamBuffer === buffer) activeStreamBuffer = null;
+
+      // 边界：pi 没有产出任何 text_delta（极少数模型 / 极短回复）
+      if (!streamedAnyText) {
+        if (!reply || reply === '(无回复)') {
+          await safeSend(config, userId, '🤔 pi 没有返回内容，可能是当前任务不需要文字回复，或者处理中遇到了问题。你可以继续发送消息。');
+        } else {
+          await sendChunked(userId, reply);
+        }
+      }
+      // streamedAnyText === true 时不再发完整回复，避免重复
+      return;
+    }
+
+    // ---------- 非流式路径（与原行为一致） ----------
     if (!reply || reply === '(无回复)') {
       await safeSend(config, userId, '🤔 pi 没有返回内容，可能是当前任务不需要文字回复，或者处理中遇到了问题。你可以继续发送消息。');
       return;
     }
-
-    // pi 的回复可能很长，企业微信单条消息有长度限制 (2048 字符)
-    // 如果超过限制，分段发送
-    const MAX_LEN = 2000;
-    if (reply.length <= MAX_LEN) {
-      await safeSend(config, userId, reply);
-    } else {
-      // 分段发送
-      const chunks = [];
-      let remaining = reply;
-      while (remaining.length > 0) {
-        chunks.push(remaining.slice(0, MAX_LEN));
-        remaining = remaining.slice(MAX_LEN);
-      }
-
-      for (let i = 0; i < chunks.length; i++) {
-        const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
-        await safeSend(config, userId, prefix + chunks[i]);
-        // 避免发送太快被限流
-        if (i < chunks.length - 1) {
-          await new Promise(r => setTimeout(r, 500));
-        }
-      }
-    }
+    await sendChunked(userId, reply);
   } catch (err) {
     console.error('[msg] pi 处理失败:', err);
+    if (buffer) {
+      try { await buffer.finalize(); } catch {}
+      if (activeStreamBuffer === buffer) activeStreamBuffer = null;
+    }
     await safeSend(config, userId, `❌ 处理失败: ${err.message}`);
   } finally {
     isPiBusy = false;
     if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
+    if (activeStreamBuffer === buffer) activeStreamBuffer = null;
+  }
+}
+
+/**
+ * 把过长的回复分段发出。企业微信单条文本约 2048 字符；超过 MAX_LEN 自动切片。
+ */
+async function sendChunked(userId, reply) {
+  const MAX_LEN = 2000;
+  if (reply.length <= MAX_LEN) {
+    await safeSend(config, userId, reply);
+    return;
+  }
+  const chunks = [];
+  let remaining = reply;
+  while (remaining.length > 0) {
+    chunks.push(remaining.slice(0, MAX_LEN));
+    remaining = remaining.slice(MAX_LEN);
+  }
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
+    await safeSend(config, userId, prefix + chunks[i]);
+    if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
   }
 }
 
 // ===== 健康检查 =====
 app.get('/health', (req, res) => {
+  // 真实检测 pi 子进程是否存活：proc.pid 可能还在但进程已退出
+  const piAlive = piClient?.proc?.pid && !piClient.proc.killed;
+  // 更可靠：尝试检查 /proc (Linux) 或 kill -0
+  let piActuallyRunning = false;
+  if (piAlive) {
+    try { piActuallyRunning = process.kill(piClient.proc.pid, 0); } catch { piActuallyRunning = false; }
+  }
+
   res.json({
     status: 'ok',
-    pi: piClient?.proc ? 'running' : 'stopped',
+    pi: piActuallyRunning ? 'running' : (piRestarting ? 'restarting' : 'stopped'),
     isPiBusy,
+    piPid: piClient?.proc?.pid || null,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ===== 更新企业微信回调 URL =====
+app.post('/update-callback', express.json(), async (req, res) => {
+  const { url } = req.body;
+  if (!url) {
+    return res.json({ status: 'error', message: '缺少 url 参数' });
+  }
+  console.log('[callback] 更新回调 URL:', url);
+  try {
+    await updateCallbackUrl(config, url, config.token, config.encodingAesKey);
+    res.json({ status: 'ok', message: '回调 URL 已更新', url });
+  } catch (err) {
+    console.error('[callback] 更新回调 URL 失败:', err.message);
+    res.json({ status: 'error', message: err.message });
+  }
+});
+
+// ===== pi 强制重启端点（watchdog 调用，不杀整个 bridge） =====
+app.post('/pi-restart', async (req, res) => {
+  console.log('[pi-restart] 收到外部重启请求');
+  if (piRestarting) {
+    return res.json({ status: 'already_restarting', message: 'pi 正在重启中，请稍候' });
+  }
+  try {
+    if (piClient) piClient.stop();
+    await new Promise(r => setTimeout(r, 1000));
+    await startPi({ isRestart: true });
+    res.json({ status: 'ok', message: 'pi 已重启', piPid: piClient?.proc?.pid });
+  } catch (err) {
+    res.json({ status: 'error', message: err.message });
+  }
 });
 
 // ===== 启动 =====
@@ -481,17 +615,67 @@ async function main() {
   } else {
     console.log('   允许所有用户');
   }
+  if (config.adminUser) {
+    console.log(`   管理员: ${config.adminUser}`);
+  }
 
   await startPi();
 
-  app.listen(config.bridgePort, () => {
+  app.listen(config.bridgePort, async () => {
     console.log(`\n✅ 桥接服务器已启动: http://localhost:${config.bridgePort}`);
     console.log(`\n📋 企业微信配置回调 URL:`);
     console.log(`   URL: http://<你的服务器IP>:${config.bridgePort}/wxwork/callback`);
     console.log(`   Token: ${config.token}`);
     console.log(`   EncodingAESKey: ${config.encodingAesKey}`);
     console.log(`\n💡 健康检查: http://localhost:${config.bridgePort}/health`);
+
+    // 自动启动 cloudflared tunnel
+    if (process.env.TUNNEL !== 'false') {
+      try {
+        await startTunnel();
+      } catch (err) {
+        console.error('⚠️ [tunnel] 启动失败:', err.message);
+        console.error('   bridge 仍可运行，但企业微信回调需要手动配置网络穿透');
+      }
+    }
   });
+}
+
+/**
+ * 启动 cloudflared tunnel 并通知管理员新的回调 URL
+ */
+async function startTunnel() {
+  const logDir = process.env.TUNNEL_LOG_DIR || `${process.env.HOME}/logs/pi-wechat-bridge`;
+
+  tunnelManager = new TunnelManager({
+    bridgePort: config.bridgePort,
+    logDir,
+    onUrlChange: async (newUrl) => {
+      const callbackUrl = `${newUrl}/wxwork/callback`;
+      console.log(`\n🔗 Tunnel URL: ${newUrl}`);
+      console.log(`   回调地址: ${callbackUrl}`);
+
+      // 通知管理员
+      if (config.adminUser) {
+        try {
+          await sendMarkdownMessage(config, config.adminUser,
+            `## 🔧 Tunnel URL 已更新\n` +
+            `**回调地址:**\n\`${callbackUrl}\`\n\n` +
+            `请前往[企业微信管理后台](https://work.weixin.qq.com/wework_admin/frame#apps)修改接收消息的 URL\n\n` +
+            `> Token: \`${config.token}\`\n> EncodingAESKey: \`${config.encodingAesKey}\``
+          );
+          console.log(`[tunnel] 已通知管理员 ${config.adminUser}`);
+        } catch (err) {
+          console.error('[tunnel] 通知管理员失败:', err.message);
+        }
+      } else {
+        console.log('⚠️ [tunnel] 未配置 ADMIN_USER，无法自动通知');
+        console.log('   请设置 ADMIN_USER 环境变量（你的企业微信 UserID）');
+      }
+    },
+  });
+
+  await tunnelManager.start();
 }
 
 // 优雅退出（带超时保护，防止无限挂起）
@@ -503,6 +687,7 @@ function gracefulShutdown(signal) {
   }, 10000);
   timer.unref?.();
   if (piClient) piClient.stop();
+  if (tunnelManager) tunnelManager.stop();
   // 给 stop 一点时间，然后退出
   setTimeout(() => {
     clearTimeout(timer);

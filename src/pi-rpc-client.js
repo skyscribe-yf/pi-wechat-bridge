@@ -6,8 +6,16 @@
  *   - extension_ui_request: 初始连接时请求 UI 配置
  *   - response: 命令响应 (id 匹配)
  *   - agent_start: agent 开始处理
- *   - message_update (assistantMessageEvent.type=text_delta): 增量文本
+ *   - message_update:
+ *       assistantMessageEvent.type=text_delta      → 增量文本
+ *       assistantMessageEvent.type=thinking_delta  → 增量思考
+ *   - tool_execution_start / tool_execution_end:   工具调用开始/结束
+ *   - auto_retry_start / auto_retry_end:           自动重试
+ *   - compaction_start / compaction_end:           上下文压缩
  *   - agent_end: agent 完成响应，包含最终文本
+ *
+ * prompt() 接受可选的 onProgress 回调，按 ProgressEvent 形状投递进度事件
+ * （见 docs/streaming 或 AGENTS.md）。thinking_delta 不会累积进最终返回的字符串。
  */
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
@@ -131,6 +139,24 @@ export class PiRpcClient {
   }
 
   /**
+   * 向当前活跃的 prompt 请求广播一个 ProgressEvent。
+   * 单 pi 进程同时只跑一个 prompt（受 server.js isPiBusy 锁约束），
+   * 因此对所有带 onProgress 的 pending 都触发回调。
+   * 回调内部抛出的异常被吞掉，不影响主流程。
+   */
+  _dispatchProgress(event) {
+    for (const [, pending] of this.pendingRequests) {
+      if (pending.text !== undefined && typeof pending.onProgress === 'function') {
+        try {
+          pending.onProgress(event);
+        } catch (e) {
+          console.error('[pi-rpc] onProgress 回调错误:', e?.message || e);
+        }
+      }
+    }
+  }
+
+  /**
    * 处理来自 pi 的消息
    */
   _handleMessage(msg) {
@@ -168,7 +194,7 @@ export class PiRpcClient {
       return;
     }
 
-    // 增量文本
+    // 流式增量: text_delta / thinking_delta
     if (msg.type === 'message_update') {
       const evt = msg.assistantMessageEvent;
       if (evt?.type === 'text_delta' && evt.delta) {
@@ -177,7 +203,67 @@ export class PiRpcClient {
             pending.text += evt.delta;
           }
         }
+        this._dispatchProgress({ type: 'text_delta', delta: evt.delta });
+      } else if (evt?.type === 'thinking_delta' && evt.delta) {
+        // 思考增量不进入 pending.text（最终回复不应包含 chain-of-thought）
+        this._dispatchProgress({ type: 'thinking_delta', delta: evt.delta });
       }
+      return;
+    }
+
+    // 工具调用
+    if (msg.type === 'tool_execution_start') {
+      this._dispatchProgress({
+        type: 'tool_start',
+        toolCallId: msg.toolCallId,
+        toolName: msg.toolName,
+        args: msg.args || {},
+      });
+      return;
+    }
+    if (msg.type === 'tool_execution_end') {
+      this._dispatchProgress({
+        type: 'tool_end',
+        toolCallId: msg.toolCallId,
+        toolName: msg.toolName,
+        isError: msg.isError === true,
+      });
+      return;
+    }
+    // tool_execution_update: 故意不转发（partialResult 噪声过大）
+
+    // 自动重试
+    if (msg.type === 'auto_retry_start') {
+      this._dispatchProgress({
+        type: 'auto_retry_start',
+        attempt: msg.attempt,
+        maxAttempts: msg.maxAttempts,
+        delayMs: msg.delayMs,
+        errorMessage: msg.errorMessage || '',
+      });
+      return;
+    }
+    if (msg.type === 'auto_retry_end') {
+      this._dispatchProgress({
+        type: 'auto_retry_end',
+        success: msg.success === true,
+        attempt: msg.attempt,
+        finalError: msg.finalError,
+      });
+      return;
+    }
+
+    // 上下文压缩
+    if (msg.type === 'compaction_start') {
+      this._dispatchProgress({ type: 'compaction_start', reason: msg.reason || 'unknown' });
+      return;
+    }
+    if (msg.type === 'compaction_end') {
+      this._dispatchProgress({
+        type: 'compaction_end',
+        aborted: msg.aborted === true,
+        errorMessage: msg.errorMessage,
+      });
       return;
     }
 
@@ -221,11 +307,23 @@ export class PiRpcClient {
   /**
    * 发送 prompt 并等待 agent 完成响应
    * @param {string} message - 用户消息
-   * @param {number} [timeout=300000] - 超时时间（毫秒），默认 5 分钟
-   * @returns {Promise<string>} 助手回复文本
+   * @param {number|{timeout?: number, onProgress?: (event: object) => void}} [timeoutOrOptions=300000]
+   *   兼容旧签名：传 number 表示超时毫秒数
+   *   新签名：传对象 { timeout, onProgress }，onProgress 接收 ProgressEvent
+   * @returns {Promise<string>} 助手回复文本（不含 thinking）
    */
-  async prompt(message, timeout = 300000) {
+  async prompt(message, timeoutOrOptions = 300000) {
     if (!this.proc) throw new Error('pi RPC 未启动');
+
+    // 解析参数：兼容 prompt(msg, 60000) 旧用法
+    let timeout = 300000;
+    let onProgress = null;
+    if (typeof timeoutOrOptions === 'number') {
+      timeout = timeoutOrOptions;
+    } else if (timeoutOrOptions && typeof timeoutOrOptions === 'object') {
+      if (typeof timeoutOrOptions.timeout === 'number') timeout = timeoutOrOptions.timeout;
+      if (typeof timeoutOrOptions.onProgress === 'function') onProgress = timeoutOrOptions.onProgress;
+    }
 
     const id = `req-${this.nextId++}`;
 
@@ -235,7 +333,7 @@ export class PiRpcClient {
         reject(new Error(`pi 响应超时 (${timeout / 1000}s)`));
       }, timeout);
 
-      this.pendingRequests.set(id, { resolve, reject, timer, text: '' });
+      this.pendingRequests.set(id, { resolve, reject, timer, text: '', onProgress });
 
       try {
         this._sendCommand({ id, type: 'prompt', message });

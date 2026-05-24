@@ -28,24 +28,56 @@ if [ -z "$BRIDGE_PID" ]; then
   REASON="bridge 进程不存在 (端口3100无人监听)"
 fi
 
-# 2. health 检查
+# 2. health 检查（含宽限期：bridge 刚启动 30s 内只做健康探测，不判断 pi 状态）
 if [ "$NEED_RESTART" = false ]; then
   HEALTH=$(curl -s --connect-timeout 5 --max-time 10 http://localhost:3100/health 2>/dev/null)
   if [ -z "$HEALTH" ]; then
     NEED_RESTART=true
     REASON="health 检查无响应"
-  elif ! echo "$HEALTH" | grep -q 'ok'; then
+  elif ! echo "$HEALTH" | grep -q '"status":"ok"'; then
     NEED_RESTART=true
     REASON="health 检查返回异常: $HEALTH"
   fi
+
+  # 宽限期检测：bridge 进程启动不足 30 秒 → 只做基本存活检查，跳过 pi 进程检测
+  if [ "$NEED_RESTART" = false ] && [ -n "$BRIDGE_PID" ]; then
+    BRIDGE_UPTIME=$(ps -o etimes= -p "$BRIDGE_PID" 2>/dev/null | awk '{print int($1)}')
+    if [ -n "$BRIDGE_UPTIME" ] && [ "$BRIDGE_UPTIME" -lt 30 ]; then
+      TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+      echo "[$TIMESTAMP] ℹ️ bridge 启动不足30s (uptime=${BRIDGE_UPTIME}s)，跳过 pi 进程检测" >> "$WATCHDOG_LOG"
+      # 正常运行，静默退出
+      exit 0
+    fi
+  fi
 fi
 
-# 3. pi 进程是否存活
+# 3. pi 进程是否存活（仅在宽限期过后检查）
 if [ "$NEED_RESTART" = false ]; then
-  PI_PID=$(pgrep -f "pi --mode rpc" || true)
-  if [ -z "$PI_PID" ]; then
-    NEED_RESTART=true
-    REASON="pi RPC 进程已死，但 bridge 还在"
+  PI_STATUS=$(echo "$HEALTH" | grep -o '"pi":"[^"]*"' | head -1 | sed 's/"pi":"//;s/"//')
+  if [ "$PI_STATUS" = "restarting" ]; then
+    # pi 正在自动重启中，不干预
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$TIMESTAMP] ℹ️ pi 正在重启中，跳过" >> "$WATCHDOG_LOG"
+    exit 0
+  fi
+
+  if [ "$PI_STATUS" != "running" ]; then
+    # pi 已死，先尝试通过 /pi-restart 端点重启 pi，不杀 bridge
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$TIMESTAMP] ⚠️ pi 进程已死，尝试通过 /pi-restart 端点重启..." >> "$WATCHDOG_LOG"
+    RESTART_RESULT=$(curl -s --connect-timeout 5 --max-time 30 -X POST http://localhost:3100/pi-restart 2>/dev/null)
+    if echo "$RESTART_RESULT" | grep -q '"status":"ok"'; then
+      echo "[$TIMESTAMP] ✅ pi 通过 /pi-restart 重启成功" >> "$WATCHDOG_LOG"
+      echo "0" > "$STUCK_FLAG" 2>/dev/null
+      exit 0
+    elif echo "$RESTART_RESULT" | grep -q '"status":"already_restarting"'; then
+      echo "[$TIMESTAMP] ℹ️ pi 已在重启中" >> "$WATCHDOG_LOG"
+      exit 0
+    else
+      # /pi-restart 失败，降级为杀整个 bridge 重启
+      NEED_RESTART=true
+      REASON="pi 进程已死且 /pi-restart 失败: $RESTART_RESULT"
+    fi
   fi
 fi
 
@@ -58,8 +90,12 @@ if [ "$NEED_RESTART" = false ]; then
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$STUCK_FLAG"
     if [ "$COUNT" -ge 5 ]; then
-      NEED_RESTART=true
-      REASON="isPiBusy 卡住超过5分钟 (stuck=$COUNT)"
+      # 卡住了，尝试 abort 而非杀进程
+      TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+      echo "[$TIMESTAMP] ⚠️ isPiBusy 卡住超过5分钟 (stuck=$COUNT)，发送 /abort" >> "$WATCHDOG_LOG"
+      curl -s --connect-timeout 5 --max-time 10 "http://localhost:3100/wxwork/callback?msg_signature=internal&timestamp=$(date +%s)&nonce=watchdog" -X POST -d '<xml><MsgType>text</MsgType><Content>/abort</Content><FromUserName>watchdog</FromUserName></xml>' >/dev/null 2>&1
+      # 不需要杀进程，abort 后 isPiBusy 自然释放
+      echo "0" > "$STUCK_FLAG" 2>/dev/null
     fi
   else
     # 不 busy，清零计数
@@ -72,7 +108,7 @@ if [ "$NEED_RESTART" = false ]; then
   exit 0
 fi
 
-# ===== 重启 =====
+# ===== 重启（仅 bridge 整体挂掉或 /pi-restart 失败时才走这里） =====
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 echo "[$TIMESTAMP] ⚠️ $REASON，正在重启..." >> "$WATCHDOG_LOG"
 
@@ -95,9 +131,9 @@ fi
 cd /home/skyscribe/srcs/pi-wechat-bridge
 nohup node src/server.js >> "$BRIDGE_LOG" 2>&1 &
 NEW_PID=$!
-sleep 6
+sleep 8
 
-# 验证
+# 验证（给更多时间，因为 pi 启动也需要几秒）
 NEW_HEALTH=$(curl -s --connect-timeout 5 http://localhost:3100/health 2>/dev/null)
 if kill -0 $NEW_PID 2>/dev/null && echo "$NEW_HEALTH" | grep -q 'ok'; then
   echo "[$TIMESTAMP] ✅ 重启成功 (PID: $NEW_PID)" >> "$WATCHDOG_LOG"

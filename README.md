@@ -92,6 +92,7 @@ npm start
 
 | 命令 | 说明 |
 |------|------|
+| `/stream on\|off\|status` | 流式模式开关（实时推送 pi 中间产出，默认关闭） |
 | `/abort` | 中止 pi 当前操作 |
 | `/status` | 查看 pi 当前状态 |
 

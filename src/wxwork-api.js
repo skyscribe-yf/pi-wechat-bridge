@@ -101,6 +101,52 @@ export async function sendTextMessage(config, userId, content) {
 }
 
 /**
+ * 更新接收消息的回调 URL
+ * @param {object} config - { corpId, secret }
+ * @param {string} url - 新的回调 URL
+ * @param {string} token - 回调 Token
+ * @param {string} encodingAesKey - 回调 EncodingAESKey
+ */
+export async function updateCallbackUrl(config, url, token, encodingAesKey) {
+  const accessToken = await getAccessToken(config.corpId, config.secret);
+
+  const apiUrl = `${BASE_URL}/call_back/set`;
+  const resp = await axios.post(apiUrl, {
+    url,
+    token,
+    encodingaeskey: encodingAesKey,
+  }, {
+    params: { access_token: accessToken },
+    timeout: 15000,
+  });
+
+  if (resp.data.errcode === 42001 || resp.data.errcode === 40014) {
+    clearAccessTokenCache();
+    const newToken = await getAccessToken(config.corpId, config.secret);
+    const retryResp = await axios.post(apiUrl, {
+      url,
+      token,
+      encodingaeskey: encodingAesKey,
+    }, {
+      params: { access_token: newToken },
+      timeout: 15000,
+    });
+    if (retryResp.data.errcode !== 0) {
+      throw new Error(`更新回调 URL 失败(重试): ${retryResp.data.errmsg} (errcode: ${retryResp.data.errcode})`);
+    }
+    console.log('[wxwork] 回调 URL 已更新(重试):', url);
+    return retryResp.data;
+  }
+
+  if (resp.data.errcode !== 0) {
+    throw new Error(`更新回调 URL 失败: ${resp.data.errmsg} (errcode: ${resp.data.errcode})`);
+  }
+
+  console.log('[wxwork] 回调 URL 已更新:', url);
+  return resp.data;
+}
+
+/**
  * 发送 Markdown 消息（企业微信支持简单的 markdown）
  */
 export async function sendMarkdownMessage(config, userId, content) {
