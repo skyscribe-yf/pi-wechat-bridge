@@ -19,6 +19,7 @@
  */
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
+import fs from 'node:fs/promises';
 
 export class PiRpcClient {
   constructor(options = {}) {
@@ -29,6 +30,7 @@ export class PiRpcClient {
     this.thinking = options.thinking;
     this.tools = options.tools;
     this.noSession = options.noSession !== false; // 默认 true
+    this.sessionDir = options.sessionDir || null;
     this.noExtensions = options.noExtensions || false;
     this.noSkills = options.noSkills || false;
     this.noContextFiles = options.noContextFiles || false;
@@ -44,9 +46,19 @@ export class PiRpcClient {
    * 启动 pi RPC 进程
    */
   async start() {
+    // Ensure session directory exists before starting pi
+    if (this.sessionDir && !this.noSession) {
+      await fs.mkdir(this.sessionDir, { recursive: true }).catch(err => {
+        console.warn(`[pi-rpc] 无法创建会话目录 ${this.sessionDir}: ${err.message}`);
+      });
+    }
+
     return new Promise((resolve, reject) => {
       const args = ['--mode', 'rpc'];
       if (this.noSession) args.push('--no-session');
+      if (this.sessionDir) {
+        args.push('--session-dir', this.sessionDir);
+      }
       if (this.noExtensions) args.push('--no-extensions');
       if (this.noSkills) args.push('--no-skills');
       if (this.noContextFiles) args.push('--no-context-files');
@@ -382,7 +394,7 @@ export class PiRpcClient {
    */
   async setModel(provider, modelId) {
     const id = `req-${this.nextId++}`;
-    return new Promise((resolve, reject) => {
+    const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new Error('切换模型超时'));
@@ -391,6 +403,10 @@ export class PiRpcClient {
       this._sendCommand({ id, type: 'set_model', provider, modelId });
       console.log(`[pi-rpc] 切换模型: ${provider}/${modelId}`);
     });
+    // 同步更新内部属性，确保进程重启后 start() 使用最新偏好
+    this.provider = provider;
+    this.model = modelId;
+    return result;
   }
 
   /**
@@ -415,7 +431,7 @@ export class PiRpcClient {
    */
   async setThinkingLevel(level) {
     const id = `req-${this.nextId++}`;
-    return new Promise((resolve, reject) => {
+    const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new Error('设置思考等级超时'));
@@ -423,6 +439,9 @@ export class PiRpcClient {
       this.pendingRequests.set(id, { resolve, reject, timer });
       this._sendCommand({ id, type: 'set_thinking_level', level });
     });
+    // 同步更新内部属性，确保进程重启后 start() 使用最新偏好
+    this.thinking = level;
+    return result;
   }
 
   /**

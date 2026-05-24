@@ -7,9 +7,11 @@
 import express from 'express';
 import { parseStringPromise } from 'xml2js';
 import dotenv from 'dotenv';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import { encrypt, decrypt, verifySignature } from './wxwork-crypto.js';
 import { sendTextMessage, sendMarkdownMessage, updateCallbackUrl } from './wxwork-api.js';
-import { TunnelManager } from './tunnel.js';
 import { PiRpcClient } from './pi-rpc-client.js';
 import { StreamBuffer } from './stream-buffer.js';
 
@@ -71,6 +73,87 @@ const userStreamEnabled = new Map();
 /** @type {Map<string, string[]>} */
 const composingUsers = new Map();
 
+// ===== 用户偏好持久化（跨会话回收 / 进程重启保留） =====
+/** @type {Map<string, {provider?: string, modelId?: string, thinking?: string}>} */
+const userPreferences = new Map();
+
+const PREF_DIR = path.join(os.homedir(), '.pi', 'wechat-bridge');
+const PREF_FILE = path.join(PREF_DIR, 'preferences.json');
+let prefSaveTimer = null;
+
+/** 从磁盘加载偏好（启动时调用） */
+async function loadPreferences() {
+  try {
+    const raw = await fs.readFile(PREF_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && typeof data === 'object') {
+      for (const [uid, pref] of Object.entries(data)) {
+        if (pref && typeof pref === 'object') userPreferences.set(uid, pref);
+      }
+      console.log(`📋 [pref] 已加载 ${userPreferences.size} 个用户偏好`);
+    }
+  } catch {
+    // 文件不存在或解析失败 → 空偏好，正常
+  }
+}
+
+/** 异步持久化偏好到磁盘（写入临时文件后 rename，防止写半截断电丢数据） */
+async function savePreferences() {
+  const obj = Object.fromEntries(userPreferences);
+  try {
+    await fs.mkdir(PREF_DIR, { recursive: true });
+    const tmpFile = PREF_FILE + '.tmp';
+    await fs.writeFile(tmpFile, JSON.stringify(obj, null, 2), 'utf8');
+    await fs.rename(tmpFile, PREF_FILE);
+  } catch (e) {
+    console.error('[pref] 保存偏好文件失败:', e.message);
+  }
+}
+
+/** 防抖持久化（500ms 内多次 setUserPref 只触发一次写盘） */
+function schedulePrefSave() {
+  if (prefSaveTimer) clearTimeout(prefSaveTimer);
+  prefSaveTimer = setTimeout(() => { prefSaveTimer = null; savePreferences(); }, 500);
+  prefSaveTimer.unref?.();
+}
+
+/** 获取用户偏好，未设置的字段回退到全局默认 */
+function getUserPref(userId) {
+  const pref = userPreferences.get(userId) || {};
+  return {
+    provider: pref.provider || config.piProvider,
+    modelId: pref.modelId || config.piModel,
+    thinking: pref.thinking || config.piThinking,
+  };
+}
+
+/** 更新用户偏好字段（内存 + 防抖写盘） */
+function setUserPref(userId, updates) {
+  const pref = userPreferences.get(userId) || {};
+  Object.assign(pref, updates);
+  userPreferences.set(userId, pref);
+  schedulePrefSave();
+}
+
+/** 恢复用户偏好到运行中的 pi 进程（重启后调用） */
+async function reapplyUserPref(userId, client) {
+  const pref = getUserPref(userId);
+  // 无条件 apply：PiRpcClient 内部属性可能过时（setModel/setThinkingLevel 不更新 constructor 属性），
+  // 所以即使偏好等于全局默认，也需要同步到当前进程
+  if (pref.provider && pref.modelId) {
+    try {
+      await client.setModel(pref.provider, pref.modelId);
+      console.log(`✅ [pi-rpc:${userId}] 恢复模型: ${pref.provider}/${pref.modelId}`);
+    } catch (e) { console.warn(`⚠️ [pi-rpc:${userId}] 恢复模型失败:`, e.message); }
+  }
+  if (pref.thinking) {
+    try {
+      await client.setThinkingLevel(pref.thinking);
+      console.log(`✅ [pi-rpc:${userId}] 恢复思考等级: ${pref.thinking}`);
+    } catch (e) { console.warn(`⚠️ [pi-rpc:${userId}] 恢复思考等级失败:`, e.message); }
+  }
+}
+
 function isStreamingEnabledFor(userId) {
   return userStreamEnabled.get(userId) === true;
 }
@@ -106,14 +189,20 @@ const modelAliases = {
 class UserSession {
   constructor(userId) {
     this.userId = userId;
+    // 每个用户独立的 session 目录，便于 /clear 时彻底删除
+    const sanitizedUserId = userId.replace(/[^a-zA-Z0-9_.@-]/g, '_');
+    this.sessionDir = path.join(os.homedir(), '.pi', 'agent', 'sessions', 'pi-wechat-bridge', sanitizedUserId);
+    // 用用户偏好初始化 pi 客户端（内存级 + 磁盘持久化）
+    const pref = getUserPref(userId);
     this.client = new PiRpcClient({
       piBin: config.piBin,
       cwd: config.piCwd,
-      provider: config.piProvider,
-      model: config.piModel,
-      thinking: config.piThinking,
+      provider: pref.provider,
+      model: pref.modelId,
+      thinking: pref.thinking,
       tools: config.piTools,
       noSession: config.piNoSession,
+      sessionDir: config.piNoSession ? undefined : this.sessionDir,
       noExtensions: config.piNoExtensions,
       noSkills: config.piNoSkills,
       noContextFiles: config.piNoContextFiles,
@@ -133,6 +222,8 @@ class UserSession {
       await new Promise(r => setTimeout(r, 2000));
       try {
         await this.start();
+        // 重启后恢复用户偏好（模型 / 思考等级）
+        await reapplyUserPref(userId, this.client);
         console.log(`✅ [pi-rpc:${userId}] 已自动重启`);
       } catch (err) {
         console.error(`❌ [pi-rpc:${userId}] 自动重启失败:`, err.message);
@@ -189,10 +280,11 @@ async function getUserSession(userId) {
   }
   const session = userSessions.get(userId);
   session.lastActive = Date.now();
-  // pi 进程挂了但 session 对象还在 → 重启
+  // pi 进程挂了但 session 对象还在 → 重启并恢复偏好
   if (!session.isAlive() && !session.starting) {
     console.log(`[pi-rpc:${userId}] 进程已死，重启中...`);
     await session.start();
+    await reapplyUserPref(userId, session.client);
   }
   return session;
 }
@@ -312,6 +404,7 @@ async function handleMessage(msg) {
       '  "换讯飞"\n\n' +
       '⌨️ 文字命令:\n' +
       '  /model deepseek     切换模型\n' +
+      '  /model default       恢复默认模型\n' +
       '  /thinking high      思考等级\n' +
       '  /stream on|off      流式模式开关\n' +
       '  /clear              清除自己的会话\n' +
@@ -378,6 +471,16 @@ async function handleMessage(msg) {
     if (session) {
       session.stop();
       userSessions.delete(userId);
+      // ⚠️ /clear 只清除对话上下文，不清除用户偏好（模型/思考等级）
+      // 用户可发 /model default 回退全局默认模型
+      if (session.sessionDir) {
+        try {
+          await fs.rm(session.sessionDir, { recursive: true, force: true });
+          console.log(`[session] 已删除会话目录: ${session.sessionDir}`);
+        } catch (err) {
+          console.error(`[session] 删除会话目录失败: ${err.message}`);
+        }
+      }
       await safeSend(config, userId, '🧹 会话已清除，下次发消息将创建新会话');
     } else {
       await safeSend(config, userId, 'ℹ️ 当前没有活跃会话');
@@ -423,6 +526,14 @@ async function handleMessage(msg) {
     if (session) {
       session.stop();
       userSessions.delete(targetUserId);
+      // 删除磁盘会话文件
+      if (session.sessionDir) {
+        try {
+          await fs.rm(session.sessionDir, { recursive: true, force: true });
+        } catch (err) {
+          console.error(`[session] 删除会话目录失败: ${err.message}`);
+        }
+      }
       await safeSend(config, userId, `🧹 已清除用户 \`${targetUserId}\` 的会话`);
     } else {
       await safeSend(config, userId, `ℹ️ 用户 \`${targetUserId}\` 没有活跃会话`);
@@ -437,7 +548,17 @@ async function handleMessage(msg) {
       await safeSend(config, userId, 'ℹ️ 当前没有活跃会话');
       return;
     }
-    for (const [, session] of userSessions) session.stop();
+    for (const [, session] of userSessions) {
+      session.stop();
+      // 删除磁盘会话文件
+      if (session.sessionDir) {
+        try {
+          await fs.rm(session.sessionDir, { recursive: true, force: true });
+        } catch (err) {
+          console.error(`[session] 删除会话目录失败: ${err.message}`);
+        }
+      }
+    }
     userSessions.clear();
     if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
     await safeSend(config, userId, `🧹 已清除所有 ${count} 个会话`);
@@ -463,6 +584,7 @@ async function handleMessage(msg) {
   // ===== /status =====
   if (content === '/status') {
     const session = userSessions.get(userId);
+    const pref = getUserPref(userId);
     const parts = [
       `📊 会话状态:`,
       `- pi 进程: ${session?.isAlive() ? 'running' : 'not started'}`,
@@ -470,6 +592,12 @@ async function handleMessage(msg) {
       `- 流式: ${isStreamingEnabledFor(userId) ? '开启' : '关闭'}`,
       `- 多段输入: ${composingUsers.has(userId) ? `进行中 (${composingUsers.get(userId)?.length} 段)` : '无'}`,
     ];
+    if (pref.provider && pref.modelId && (pref.provider !== config.piProvider || pref.modelId !== config.piModel)) {
+      parts.push(`- 偏好模型: ${pref.provider}/${pref.modelId}`);
+    }
+    if (pref.thinking && pref.thinking !== config.piThinking) {
+      parts.push(`- 偏好思考: ${pref.thinking}`);
+    }
     if (session?.lastActive) {
       const idleMin = Math.round((Date.now() - session.lastActive) / 60000);
       parts.push(`- 空闲: ${idleMin}min`);
@@ -493,6 +621,31 @@ async function handleMessage(msg) {
   let modelMatch = null;
   if (content.startsWith('/model ')) {
     const modelStr = content.slice(7).trim();
+    // /model default / /model 默认 → 清除偏好，回退全局默认
+    if (modelStr === 'default' || modelStr === '默认') {
+      const session = userSessions.get(userId);
+      const pref = getUserPref(userId);
+      // 如果有偏好且与全局默认不同，需要 apply 全局默认
+      if (pref.provider !== config.piProvider || pref.modelId !== config.piModel) {
+        if (session?.isAlive()) {
+          try { await session.client.setModel(config.piProvider, config.piModel); } catch {}
+        }
+        // 重置 PiRpcClient 内部属性，确保后续 start() 用全局默认
+        session.client.provider = config.piProvider;
+        session.client.model = config.piModel;
+      }
+      if (pref.thinking !== config.piThinking) {
+        if (session?.isAlive()) {
+          try { await session.client.setThinkingLevel(config.piThinking); } catch {}
+        }
+        session.client.thinking = config.piThinking;
+      }
+      // 删除该用户偏好
+      userPreferences.delete(userId);
+      schedulePrefSave();
+      await safeSend(config, userId, `✅ 已恢复默认模型: ${config.piProvider}/${config.piModel}`);
+      return;
+    }
     const parts = modelStr.split('/');
     if (parts.length === 2 && parts[0] && parts[1]) {
       modelMatch = { provider: parts[0], modelId: parts[1], name: modelStr };
@@ -522,6 +675,8 @@ async function handleMessage(msg) {
       const session = await getUserSession(userId);
       const result = await session.client.setModel(modelMatch.provider, modelMatch.modelId);
       const modelName = result?.name || modelMatch.name;
+      // 持久化用户偏好，跨会话回收 / 进程重启保留
+      setUserPref(userId, { provider: modelMatch.provider, modelId: modelMatch.modelId });
       const listLink = content.startsWith('/model') ? '' : '\n💡 发 /models 看全部模型';
       await safeSend(config, userId, `✅ 已切换到 ${modelName}${listLink}`);
     } catch (err) {
@@ -568,6 +723,8 @@ async function handleMessage(msg) {
     try {
       const session = await getUserSession(userId);
       await session.client.setThinkingLevel(level);
+      // 持久化用户偏好
+      setUserPref(userId, { thinking: level });
       await safeSend(config, userId, `✅ 思考等级已设为: ${level}`);
     } catch (err) {
       await safeSend(config, userId, `❌ 设置失败: ${err.message}`);
@@ -759,6 +916,7 @@ app.post('/pi-restart', express.json(), async (req, res) => {
       session.stop();
       try {
         await session.start();
+        await reapplyUserPref(userId, session.client);
         res.json({ status: 'ok', message: `pi for ${userId} 已重启`, pid: session.client?.proc?.pid });
       } catch (err) {
         res.json({ status: 'error', message: err.message });
@@ -773,17 +931,48 @@ app.post('/pi-restart', express.json(), async (req, res) => {
     session.stop();
     try {
       await session.start();
+      await reapplyUserPref(uid, session.client);
       count++;
     } catch {}
   }
   res.json({ status: 'ok', message: `已重启 ${count}/${userSessions.size} 个会话` });
 });
 
-// ===== Tunnel 管理 =====
-let tunnelManager = null;
+// ===== 管理员通知端点（cloudflared watchdog 调用） =====
+app.post('/notify-admin', express.json(), async (req, res) => {
+  const { message } = req.body || {};
+  if (!message) return res.json({ status: 'error', message: '缺少 message 参数' });
+  if (!config.adminUser) return res.json({ status: 'error', message: '未配置 ADMIN_USER' });
+  try {
+    await safeSend(config, config.adminUser, message);
+    res.json({ status: 'ok', message: '已通知管理员' });
+  } catch (err) {
+    res.json({ status: 'error', message: err.message });
+  }
+});
+
+// ===== Tunnel 状态端点 =====
+app.get('/tunnel-status', async (req, res) => {
+  const logDir = process.env.TUNNEL_LOG_DIR || `${process.env.HOME}/logs/pi-wechat-bridge`;
+  const urlFile = `${logDir}/tunnel-url.txt`;
+  try {
+    const url = (await fs.readFile(urlFile, 'utf8')).trim();
+    res.json({
+      status: 'ok',
+      tunnelUrl: url || null,
+      callbackUrl: url ? `${url}/wxwork/callback` : null,
+      managedBy: 'independent',
+    });
+  } catch {
+    res.json({ status: 'ok', tunnelUrl: null, callbackUrl: null, managedBy: 'independent' });
+  }
+});
+
 
 // ===== 启动 =====
 async function main() {
+  // 加载用户偏好（磁盘持久化）
+  await loadPreferences();
   console.log('🚀 pi-wechat-bridge 启动中...');
   console.log(`   端口: ${config.bridgePort}`);
   console.log(`   CorpID: ${config.corpId}`);
@@ -810,46 +999,10 @@ async function main() {
     console.log(`   EncodingAESKey: ${config.encodingAesKey}`);
     console.log(`\n💡 健康检查: http://localhost:${config.bridgePort}/health`);
 
-    if (process.env.TUNNEL !== 'false') {
-      try {
-        await startTunnel();
-      } catch (err) {
-        console.error('⚠️ [tunnel] 启动失败:', err.message);
-      }
-    }
   });
 }
 
-async function startTunnel() {
-  const logDir = process.env.TUNNEL_LOG_DIR || `${process.env.HOME}/logs/pi-wechat-bridge`;
-
-  tunnelManager = new TunnelManager({
-    bridgePort: config.bridgePort,
-    logDir,
-    onUrlChange: async (newUrl) => {
-      const callbackUrl = `${newUrl}/wxwork/callback`;
-      console.log(`\n🔗 Tunnel URL: ${newUrl}`);
-      console.log(`   回调地址: ${callbackUrl}`);
-
-      if (config.adminUser) {
-        try {
-          await sendMarkdownMessage(config, config.adminUser,
-            `## 🔧 Tunnel URL 已更新\n` +
-            `**回调地址:**\n\`${callbackUrl}\`\n\n` +
-            `请前往[企业微信管理后台](https://work.weixin.qq.com/wework_admin/frame#apps)修改接收消息的 URL\n\n` +
-            `> Token: \`${config.token}\`\n> EncodingAESKey: \`${config.encodingAesKey}\``
-          );
-        } catch (err) {
-          console.error('[tunnel] 通知管理员失败:', err.message);
-        }
-      }
-    },
-  });
-
-  await tunnelManager.start();
-}
-
-function gracefulShutdown(signal) {
+async function gracefulShutdown(signal) {
   console.log(`\n🛑 收到 ${signal}，正在关闭...`);
   const timer = setTimeout(() => { process.exit(1); }, 10000);
   timer.unref?.();
@@ -858,7 +1011,10 @@ function gracefulShutdown(signal) {
   for (const [, session] of userSessions) session.stop();
   userSessions.clear();
   if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
-  if (tunnelManager) tunnelManager.stop();
+
+  // 刷盘偏好（确保退出前不丢数据）
+  if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
+  await savePreferences();
 
   setTimeout(() => { clearTimeout(timer); process.exit(0); }, 500);
 }
