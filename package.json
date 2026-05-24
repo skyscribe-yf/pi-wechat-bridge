@@ -1,0 +1,17 @@
+{
+  "name": "pi-wechat-bridge",
+  "version": "1.0.0",
+  "description": "Bridge between pi coding agent and WeChat Work (企业微信), allowing you to control pi from WeChat",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "axios": "^1.7.0",
+    "xml2js": "^0.6.2",
+    "dotenv": "^16.4.0"
+  }
+}

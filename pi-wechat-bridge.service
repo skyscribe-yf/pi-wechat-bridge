@@ -1,0 +1,20 @@
+[Unit]
+Description=pi-wechat-bridge - WeChat Work to pi Agent Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=skyscribe
+WorkingDirectory=/home/skyscribe/srcs/pi-wechat-bridge
+ExecStart=/home/skyscribe/.nvm/versions/node/v24.15.0/bin/node src/server.js
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/skyscribe/srcs/pi-wechat-bridge/.env
+
+# 安全限制
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/skyscribe
+
+[Install]
+WantedBy=multi-user.target
