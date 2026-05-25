@@ -118,10 +118,14 @@ export class PiRpcClient {
         reject(err);
       });
 
-      this.proc.on('exit', (code, signal) => {
+      const procRef = this.proc;
+      procRef.on('exit', (code, signal) => {
         console.log(`[pi-rpc] 进程退出: code=${code}, signal=${signal}`);
-        this.proc = null;
-        this.ready = false;
+        // 只在仍是同一进程时清空引用，防止旧进程的 exit 事件覆盖新进程
+        if (this.proc === procRef) {
+          this.proc = null;
+          this.ready = false;
+        }
         // 拒绝所有等待中的请求
         for (const [, pending] of this.pendingRequests) {
           if (pending.timer) clearTimeout(pending.timer);
@@ -369,6 +373,33 @@ export class PiRpcClient {
       return;
     }
     this._sendCommand({ type: 'abort' });
+  }
+
+  /**
+   * 发送 steer 命令 — 在 pi 运行时插入用户消息，
+   * 将在当前工具调用完成后、下一次 LLM 调用前生效
+   * @param {string} message - 用户消息内容
+   */
+  steer(message) {
+    if (!this.proc || !this.proc.stdin.writable) {
+      throw new Error('pi RPC 进程未运行');
+    }
+    this._sendCommand({ type: 'steer', message });
+    console.log(`[pi-rpc] steer 已发送: ${message.slice(0, 80)}`);
+  }
+
+  /**
+   * 触发上下文压缩
+   * @param {string} [customInstructions] - 可选的自定义压缩指令
+   */
+  compact(customInstructions) {
+    if (!this.proc || !this.proc.stdin.writable) {
+      throw new Error('pi RPC 进程未运行');
+    }
+    const cmd = { type: 'compact' };
+    if (customInstructions) cmd.customInstructions = customInstructions;
+    this._sendCommand(cmd);
+    console.log('[pi-rpc] compact 已发送');
   }
 
   /**

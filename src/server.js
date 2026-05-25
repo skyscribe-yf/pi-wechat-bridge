@@ -124,6 +124,9 @@ function getUserPref(userId) {
     provider: pref.provider || config.piProvider,
     modelId: pref.modelId || config.piModel,
     thinking: pref.thinking || config.piThinking,
+    // 标记是否有用户自定义（区别于全局默认回退）
+    hasCustomModel: !!(pref.provider && pref.modelId),
+    hasCustomThinking: !!pref.thinking,
   };
 }
 
@@ -135,21 +138,23 @@ function setUserPref(userId, updates) {
   schedulePrefSave();
 }
 
-/** 恢复用户偏好到运行中的 pi 进程（重启后调用） */
+/** 恢复用户偏好到运行中的 pi 进程（重启后调用）
+ *  只 reapply 用户自定义的偏好，避免向 pi 发送冗余的 setModel/setThinkingLevel
+ */
 async function reapplyUserPref(userId, client) {
-  const pref = getUserPref(userId);
-  // 无条件 apply：PiRpcClient 内部属性可能过时（setModel/setThinkingLevel 不更新 constructor 属性），
-  // 所以即使偏好等于全局默认，也需要同步到当前进程
-  if (pref.provider && pref.modelId) {
+  const rawPref = userPreferences.get(userId);
+  if (!rawPref) return;  // 没有用户自定义，无需 reapply
+  // 只 reapply 用户显式设置的字段
+  if (rawPref.provider && rawPref.modelId) {
     try {
-      await client.setModel(pref.provider, pref.modelId);
-      console.log(`✅ [pi-rpc:${userId}] 恢复模型: ${pref.provider}/${pref.modelId}`);
+      await client.setModel(rawPref.provider, rawPref.modelId);
+      console.log(`✅ [pi-rpc:${userId}] 恢复模型: ${rawPref.provider}/${rawPref.modelId}`);
     } catch (e) { console.warn(`⚠️ [pi-rpc:${userId}] 恢复模型失败:`, e.message); }
   }
-  if (pref.thinking) {
+  if (rawPref.thinking) {
     try {
-      await client.setThinkingLevel(pref.thinking);
-      console.log(`✅ [pi-rpc:${userId}] 恢复思考等级: ${pref.thinking}`);
+      await client.setThinkingLevel(rawPref.thinking);
+      console.log(`✅ [pi-rpc:${userId}] 恢复思考等级: ${rawPref.thinking}`);
     } catch (e) { console.warn(`⚠️ [pi-rpc:${userId}] 恢复思考等级失败:`, e.message); }
   }
 }
@@ -213,18 +218,34 @@ class UserSession {
     this.lastActive = Date.now();
     this.streamBuffer = null;
     this.starting = false;
+    this.pendingInterrupts = [];  // 用户打断时暂存的新消息列表
+    this._intentionalRestart = false;  // 标记是否为主动重启，防止 exit handler 重复重启
 
     this.client.on('exit', async ({ code }) => {
-      console.warn(`[pi-rpc:${userId}] 进程退出 (code=${code})，2s 后重启...`);
+      console.warn(`[pi-rpc:${userId}] 进程退出 (code=${code})`);
       this.busy = false;
       this._clearBusyTimer();
       this.streamBuffer = null;
+      // 如果是主动重启（/restart 命令），跳过自动重启
+      if (this._intentionalRestart) {
+        this._intentionalRestart = false;
+        console.log(`[pi-rpc:${userId}] 主动重启，跳过自动重启`);
+        return;
+      }
+      console.warn(`[pi-rpc:${userId}] 非主动退出，2s 后自动重启...`);
       await new Promise(r => setTimeout(r, 2000));
       try {
         await this.start();
         // 重启后恢复用户偏好（模型 / 思考等级）
         await reapplyUserPref(userId, this.client);
         console.log(`✅ [pi-rpc:${userId}] 已自动重启`);
+        // 如果用户之前有排队的中断消息，执行最新的一条
+        if (this.pendingInterrupts.length > 0) {
+          const pending = this.pendingInterrupts.pop();  // LIFO：只执行最新的一条
+          this.pendingInterrupts = [];  // 清空其余的
+          console.log(`[pi-rpc:${userId}] 执行排队的中断消息: ${pending.slice(0, 80)}`);
+          setImmediate(() => handlePiPrompt(userId, pending));
+        }
       } catch (err) {
         console.error(`❌ [pi-rpc:${userId}] 自动重启失败:`, err.message);
       }
@@ -261,6 +282,13 @@ class UserSession {
     this.busy = false;
     this._clearBusyTimer();
     this.streamBuffer = null;
+    // 处理用户打断时排队的新消息（最多执行最后一个，避免重复）
+    if (this.pendingInterrupts.length > 0) {
+      const pending = this.pendingInterrupts.pop();  // 只执行最新的一条
+      this.pendingInterrupts = [];  // 清空其余的
+      console.log(`[pi-rpc:${this.userId}] 执行排队的中断消息: ${pending.slice(0, 80)}`);
+      setImmediate(() => handlePiPrompt(this.userId, pending));
+    }
   }
 
   _clearBusyTimer() {
@@ -407,6 +435,8 @@ async function handleMessage(msg) {
       '  /model default       恢复默认模型\n' +
       '  /thinking high      思考等级\n' +
       '  /stream on|off      流式模式开关\n' +
+      '  /restart             重启 pi 进程\n' +
+      '  /compact             压缩上下文\n' +
       '  /clear              清除自己的会话\n' +
       '  /status             查看自己的状态\n' +
       '  /models             列出模型\n' +
@@ -565,6 +595,60 @@ async function handleMessage(msg) {
     return;
   }
 
+  // ===== /restart — 重启 pi 进程（保留会话上下文） =====
+  if (content === '/restart') {
+    const session = userSessions.get(userId);
+    if (session) {
+      const wasBusy = session.busy;
+      if (wasBusy) {
+        session.client.abort();
+        if (session.streamBuffer) {
+          try { await session.streamBuffer.abort(); } catch {}
+        }
+      }
+      session.pendingInterrupts = [];  // 清除排队消息
+      session._intentionalRestart = true;  // 标记为主动重启，防止 exit handler 重复重启
+      session.stop();
+      try {
+        await session.start();
+        await reapplyUserPref(userId, session.client);
+        await safeSend(config, userId, `✅ pi 进程已重启 (PID: ${session.client?.proc?.pid})${wasBusy ? '\n⚠️ 之前有任务在运行，已被中止' : ''}`);
+      } catch (err) {
+        // 重启失败：删除会话，下次消息自动重建
+        userSessions.delete(userId);
+        await safeSend(config, userId, `❌ 重启失败: ${err.message}\n💡 下次发消息将自动创建新会话`);
+      }
+    } else {
+      try {
+        await getUserSession(userId);
+        await safeSend(config, userId, '✅ pi 会话已创建');
+      } catch (err) {
+        await safeSend(config, userId, `❌ 启动失败: ${err.message}`);
+      }
+    }
+    return;
+  }
+
+  // ===== /compact — 压缩上下文 =====
+  if (content === '/compact') {
+    const session = userSessions.get(userId);
+    if (!session?.isAlive()) {
+      await safeSend(config, userId, 'ℹ️ 当前没有活跃的 pi 进程');
+      return;
+    }
+    if (session.busy) {
+      await safeSend(config, userId, '⏳ 正在处理中，请等待当前任务完成后再压缩，或先 /abort');
+      return;
+    }
+    try {
+      session.client.compact();
+      await safeSend(config, userId, '📦 已触发上下文压缩...');
+    } catch (err) {
+      await safeSend(config, userId, `❌ 压缩请求失败: ${err.message}`);
+    }
+    return;
+  }
+
   // ===== /abort =====
   if (content === '/abort') {
     const session = userSessions.get(userId);
@@ -573,6 +657,7 @@ async function handleMessage(msg) {
       if (session.streamBuffer) {
         try { await session.streamBuffer.abort(); } catch {}
       }
+      session.pendingInterrupts = [];  // /abort 清除所有排队消息
       session.releaseBusy();
       await safeSend(config, userId, '✅ 已中止当前操作');
     } else {
@@ -592,10 +677,10 @@ async function handleMessage(msg) {
       `- 流式: ${isStreamingEnabledFor(userId) ? '开启' : '关闭'}`,
       `- 多段输入: ${composingUsers.has(userId) ? `进行中 (${composingUsers.get(userId)?.length} 段)` : '无'}`,
     ];
-    if (pref.provider && pref.modelId && (pref.provider !== config.piProvider || pref.modelId !== config.piModel)) {
+    if (pref.hasCustomModel) {
       parts.push(`- 偏好模型: ${pref.provider}/${pref.modelId}`);
     }
-    if (pref.thinking && pref.thinking !== config.piThinking) {
+    if (pref.hasCustomThinking) {
       parts.push(`- 偏好思考: ${pref.thinking}`);
     }
     if (session?.lastActive) {
@@ -624,26 +709,28 @@ async function handleMessage(msg) {
     // /model default / /model 默认 → 清除偏好，回退全局默认
     if (modelStr === 'default' || modelStr === '默认') {
       const session = userSessions.get(userId);
-      const pref = getUserPref(userId);
-      // 如果有偏好且与全局默认不同，需要 apply 全局默认
-      if (pref.provider !== config.piProvider || pref.modelId !== config.piModel) {
-        if (session?.isAlive()) {
+      const rawPref = userPreferences.get(userId);
+      // 只有用户有自定义偏好时才需要 apply 全局默认
+      if (rawPref) {
+        if (session?.isAlive() && session.client) {
           try { await session.client.setModel(config.piProvider, config.piModel); } catch {}
         }
         // 重置 PiRpcClient 内部属性，确保后续 start() 用全局默认
-        session.client.provider = config.piProvider;
-        session.client.model = config.piModel;
-      }
-      if (pref.thinking !== config.piThinking) {
-        if (session?.isAlive()) {
-          try { await session.client.setThinkingLevel(config.piThinking); } catch {}
+        if (session?.client) {
+          session.client.provider = config.piProvider;
+          session.client.model = config.piModel;
         }
-        session.client.thinking = config.piThinking;
+        if (rawPref.thinking && rawPref.thinking !== config.piThinking) {
+          if (session?.isAlive() && session.client) {
+            try { await session.client.setThinkingLevel(config.piThinking); } catch {}
+          }
+          if (session?.client) session.client.thinking = config.piThinking;
+        }
+        // 删除该用户偏好
+        userPreferences.delete(userId);
+        schedulePrefSave();
       }
-      // 删除该用户偏好
-      userPreferences.delete(userId);
-      schedulePrefSave();
-      await safeSend(config, userId, `✅ 已恢复默认模型: ${config.piProvider}/${config.piModel}`);
+      await safeSend(config, userId, `✅ 已恢复默认模型: ${config.piProvider || '(auto)'}/${config.piModel || '(auto)'}`);
       return;
     }
     const parts = modelStr.split('/');
@@ -748,9 +835,22 @@ async function handlePiPrompt(userId, content) {
     return;
   }
 
-  // 检查是否忙碌
-  if (session.busy) {
-    await safeSend(config, userId, '⏳ 正在处理中，请稍等或发 /abort 中止');
+  // 检查是否忙碌 — 使用 steer 进行中间插话
+  if (session.busy || session.starting) {
+    if (session.starting) {
+      await safeSend(config, userId, '⏳ pi 进程正在启动，请稍后重试...');
+      return;
+    }
+    // 通过 steer 命令将新消息插入下一个交互轮次
+    try {
+      session.client.steer(content);
+      session.pendingInterrupts.push(content);  // 排队，作为 fallback
+      console.log(`[pi-rpc:${userId}] 用户打断，steer 已发送: ${content.slice(0, 80)}`);
+      await safeSend(config, userId, '🔄 已将新指令插入当前处理，将在下一轮执行...');
+    } catch (err) {
+      console.error(`[pi-rpc:${userId}] steer 发送失败:`, err.message);
+      await safeSend(config, userId, '⏳ 正在处理中，steer 失败。请稍等或发 /abort 中止');
+    }
     return;
   }
 
