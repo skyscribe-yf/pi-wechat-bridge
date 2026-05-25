@@ -78,6 +78,8 @@ export class StreamBuffer {
               : '✅ 压缩完成',
         );
         break;
+      // extension_ui_request 不在此处理 — server.js 的 handleExtensionUIRequest
+      // 会发送完整的交互提示消息给用户，此处不再重复通知。
       default:
         this.log('未处理的进度事件:', event.type);
     }

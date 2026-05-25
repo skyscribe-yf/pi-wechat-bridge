@@ -221,11 +221,24 @@ class UserSession {
     this.pendingInterrupts = [];  // 用户打断时暂存的新消息列表
     this._intentionalRestart = false;  // 标记是否为主动重启，防止 exit handler 重复重启
 
+    // ===== 运行时 extension_ui_request 交互状态 =====
+    /** @type {{ id: string, method: string, title?: string, options?: string[], message?: string, placeholder?: string, prefill?: string, timeout?: number } | null} */
+    this.pendingUIRequest = null;
+    /** @type {NodeJS.Timeout | null} */
+    this.uiRequestTimer = null;
+
+    this.client.on('extension_ui_request', (req) => {
+      handleExtensionUIRequest(this.userId, req);
+    });
+
     this.client.on('exit', async ({ code }) => {
       console.warn(`[pi-rpc:${userId}] 进程退出 (code=${code})`);
       this.busy = false;
       this._clearBusyTimer();
       this.streamBuffer = null;
+      // 清理 pending UI 请求（pi 已死，无法再 respondExtensionUI）
+      this._clearUIRequestTimer();
+      this.pendingUIRequest = null;
       // 如果是主动重启（/restart 命令），跳过自动重启
       if (this._intentionalRestart) {
         this._intentionalRestart = false;
@@ -271,6 +284,8 @@ class UserSession {
     this.busy = false;
     this._clearBusyTimer();
     this.streamBuffer = null;
+    this._clearUIRequestTimer();
+    this.pendingUIRequest = null;
   }
 
   isAlive() {
@@ -293,6 +308,10 @@ class UserSession {
 
   _clearBusyTimer() {
     if (this.busyTimer) { clearTimeout(this.busyTimer); this.busyTimer = null; }
+  }
+
+  _clearUIRequestTimer() {
+    if (this.uiRequestTimer) { clearTimeout(this.uiRequestTimer); this.uiRequestTimer = null; }
   }
 }
 
@@ -399,6 +418,292 @@ app.post('/wxwork/callback', express.text({ type: 'text/xml' }), async (req, res
   }
 });
 
+// ===== Extension UI 交互处理 =====
+// 当 pi agent 运行时发起 extension_ui_request（select/confirm/input/editor 等），
+// 将请求格式化为微信消息发给用户，等待用户回复后通过 respondExtensionUI 回传给 pi。
+
+/** 对话式 UI 方法（需要用户回复） */
+const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
+
+/** 即发即弃 UI 方法（仅需展示，不需要回复） */
+const FIREFORGET_METHODS = new Set(['notify', 'setStatus', 'setWidget', 'setTitle', 'set_editor_text']);
+
+/**
+ * Sanitize pi 扩展传入的文本，防止在微信 Markdown 上下文中注入仿冒系统消息
+ * 或钓鱼链接。
+ *
+ * 策略：
+ * - 去除 Markdown 格式标记（**、>、#、[链接](url)）— 防止扩展伪造加粗/引用/标题/链接
+ * - 截断过长文本 — 防止信息淹没
+ * - 不做 HTML 清理 — 企业微信不支持 HTML，风险面有限
+ *
+ * @param {string} text - 来自 pi 扩展的原始文本
+ * @param {number} [maxLen=500] - 截断长度
+ * @returns {string} 清洗后的安全文本
+ */
+function sanitizeUIText(text, maxLen = 500) {
+  if (!text) return '';
+  // 去除 Markdown 链接 [text](url) → text（括号捕获用于 $1 替换）
+  let safe = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+  // 去除 Markdown 加粗/斜体标记
+  safe = safe.replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1');
+  // 去除 Markdown 引用标记 >
+  safe = safe.replace(/^\s*>\s*/gm, '');
+  // 去除 Markdown 标题标记 #
+  safe = safe.replace(/^\s*#{1,6}\s*/gm, '');
+  // 截断
+  if (safe.length > maxLen) safe = safe.slice(0, maxLen) + '…';
+  return safe;
+}
+
+/**
+ * 将 extension_ui_request 格式化为微信用户可读的消息并发送
+ * @param {string} userId
+ * @param {object} req - pi RPC 的 extension_ui_request 消息
+ */
+async function handleExtensionUIRequest(userId, req) {
+  const { id, method } = req;
+  console.log(`[ui-req:${userId}] method=${method}, id=${id}, title=${req.title || '(none)'}`);
+
+  // ---- 即发即弃方法：仅展示 ----
+  if (FIREFORGET_METHODS.has(method)) {
+    const text = formatFireAndForget(req);
+    if (text) await safeSend(config, userId, text);
+    return;
+  }
+
+  // ---- 对话式方法：展示 + 等待用户回复 ----
+  if (!DIALOG_METHODS.has(method)) {
+    console.warn(`[ui-req:${userId}] 未知 UI method: ${method}`);
+    return;
+  }
+
+  const session = userSessions.get(userId);
+  if (!session || !session.isAlive()) {
+    console.warn(`[ui-req:${userId}] 会话不存在或 pi 已死，忽略 UI 请求`);
+    return;
+  }
+
+  // 如果已有一个 pending 请求，先取消（响应 cancelled）
+  if (session.pendingUIRequest) {
+    console.warn(`[ui-req:${userId}] 已有 pending UI 请求 ${session.pendingUIRequest.id}，自动取消`);
+    try {
+      session.client.respondExtensionUI(session.pendingUIRequest.id, { cancelled: true });
+    } catch {}
+    session._clearUIRequestTimer();
+    session.pendingUIRequest = null;
+  }
+
+  // 格式化用户消息
+  const text = formatDialogRequest(req);
+  await safeSend(config, userId, text);
+
+  // 设为 pending
+  session.pendingUIRequest = req;
+
+  // 设置超时（pi 端也会超时，但我们在 bridge 端也设一个兜底）
+  const timeoutMs = req.timeout || 5 * 60 * 1000; // 默认 5 分钟
+  session.uiRequestTimer = setTimeout(() => {
+    session.uiRequestTimer = null;
+    if (session.pendingUIRequest && session.pendingUIRequest.id === id) {
+      console.warn(`[ui-req:${userId}] UI 请求超时 id=${id}`);
+      session.pendingUIRequest = null;
+      safeSend(config, userId, '⏰ 交互请求已超时，pi 将使用默认值继续');
+    }
+  }, timeoutMs);
+  session.uiRequestTimer.unref?.();
+}
+
+/**
+ * 处理用户对 pending UI 请求的回复
+ * @param {string} userId
+ * @param {string} content - 用户消息原文
+ * @returns {boolean} true 表示已处理（是 UI 回复），false 表示不是
+ */
+async function handleUIResponse(userId, content) {
+  const session = userSessions.get(userId);
+  if (!session || !session.pendingUIRequest) return false;
+
+  // 核心命令豁免 — 这些命令即使在有 pending UI 请求时也应正常执行
+  // /cancel 不豁免 — 有 pending UI 时作为取消 UI 请求处理
+  const COMMAND_EXEMPTIONS = ['/help', '/status', '/abort', '/restart'];
+  const trimmedLower = content.trim().toLowerCase();
+  if (COMMAND_EXEMPTIONS.includes(trimmedLower)) {
+    return false;  // 让这些命令走正常的 handleMessage 流程
+  }
+
+  const req = session.pendingUIRequest;
+  const { id, method } = req;
+
+  // 清理状态
+  session.pendingUIRequest = null;
+  session._clearUIRequestTimer();
+
+  // 用户取消
+  const trimmed = content.trim().toLowerCase();
+  if (trimmed === '/cancel' || trimmed === '取消' || trimmed === 'cancel') {
+    try {
+      session.client.respondExtensionUI(id, { cancelled: true });
+    } catch (err) {
+      console.error(`[ui-req:${userId}] 回复取消失败:`, err.message);
+    }
+    await safeSend(config, userId, '❌ 已取消交互请求');
+    return true;
+  }
+
+  // 根据方法解析用户回复
+  let response;
+  try {
+    response = parseUIResponse(method, req, content);
+  } catch (err) {
+    // 解析失败 → 提示用户重新输入
+    session.pendingUIRequest = req; // 恢复 pending 让用户重试
+    await safeSend(config, userId, `⚠️ 无法解析回复: ${err.message}\n请重新输入或发 /cancel 取消`);
+    return true;
+  }
+
+  try {
+    session.client.respondExtensionUI(id, response);
+    console.log(`[ui-req:${userId}] 已回复 id=${id}:`, JSON.stringify(response));
+  } catch (err) {
+    console.error(`[ui-req:${userId}] respondExtensionUI 失败:`, err.message);
+    await safeSend(config, userId, `❌ 回复发送失败: ${err.message}`);
+  }
+
+  return true;
+}
+
+/**
+ * 根据方法解析用户的文本回复为 extension_ui_response 的 payload
+ */
+function parseUIResponse(method, req, content) {
+  switch (method) {
+    case 'select': {
+      const options = req.options || [];
+      const trimmed = content.trim();
+      // 优先按序号匹配
+      const num = parseInt(trimmed, 10);
+      if (!isNaN(num) && num >= 1 && num <= options.length) {
+        return { value: options[num - 1] };
+      }
+      // 精确匹配选项内容（不区分大小写）
+      const idx = options.findIndex(o => o.toLowerCase() === trimmed.toLowerCase());
+      if (idx !== -1) {
+        return { value: options[idx] };
+      }
+      // 不做部分匹配 — 防止恶意选项列表利用模糊匹配误导用户意图
+      throw new Error(`无效选项 "${trimmed}"，请输入 1-${options.length} 的序号或选项完整文本`);
+    }
+    case 'confirm': {
+      const yes = ['yes', 'y', '是', '确认', '确认执行', 'ok', '允许', '同意', '好的', '好'];
+      const no = ['no', 'n', '否', '拒绝', '取消执行', 'deny', '不行'];
+      const lower = content.trim().toLowerCase();
+      if (yes.some(k => lower === k || lower.startsWith(k))) {
+        return { confirmed: true };
+      }
+      if (no.some(k => lower === k || lower.startsWith(k))) {
+        return { confirmed: false };
+      }
+      // 无法判断时默认否
+      return { confirmed: false };
+    }
+    case 'input':
+    case 'editor': {
+      // /keep = 保留原内容（仅 editor）
+      if (method === 'editor' && content.trim().toLowerCase() === '/keep') {
+        return { value: req.prefill || '' };
+      }
+      return { value: content };
+    }
+    default:
+      throw new Error(`未知的 UI 方法: ${method}`);
+  }
+}
+
+/** 格式化对话式 UI 请求为微信消息 */
+function formatDialogRequest(req) {
+  const { method, title, message, options, placeholder, prefill } = req;
+  const lines = [];
+
+  switch (method) {
+    case 'select': {
+      lines.push(`❓ **${title || '请选择'}**`);
+      if (message) lines.push(message);
+      lines.push('');
+      for (let i = 0; i < (options || []).length; i++) {
+        lines.push(`${i + 1}. ${options[i]}`);
+      }
+      lines.push('');
+      lines.push('💡 回复序号或选项内容，或发 /cancel 取消');
+      break;
+    }
+    case 'confirm': {
+      lines.push(`❓ **${title || '请确认'}**`);
+      if (message) lines.push(message);
+      lines.push('');
+      lines.push('💡 回复 是/否 或 yes/no，或发 /cancel 取消');
+      break;
+    }
+    case 'input': {
+      lines.push(`❓ **${title || '请输入'}**`);
+      if (message) lines.push(message);
+      if (placeholder) lines.push(`(提示: ${placeholder})`);
+      lines.push('');
+      lines.push('💡 直接输入内容，或发 /cancel 取消');
+      break;
+    }
+    case 'editor': {
+      lines.push(`❓ **${title || '请编辑'}**`);
+      if (message) lines.push(message);
+      if (prefill) {
+        lines.push('');
+        // 截断显示预填内容
+        const display = prefill.length > 300 ? prefill.slice(0, 300) + '…' : prefill;
+        lines.push(`已有内容:`);
+        lines.push('```');
+        lines.push(display);
+        lines.push('```');
+        lines.push('');
+        lines.push('💡 直接输入新内容，或发 /keep 保留原内容，或发 /cancel 取消');
+      } else {
+        lines.push('');
+        lines.push('💡 直接输入内容，或发 /cancel 取消');
+      }
+      break;
+    }
+  }
+
+  return lines.join('\n');
+}
+
+/** 格式化即发即忘 UI 请求为微信消息 */
+function formatFireAndForget(req) {
+  const { method, message, notifyType, statusKey, statusText, widgetKey, widgetLines, title, text } = req;
+  switch (method) {
+    case 'notify': {
+      const emoji = notifyType === 'error' ? '❌' : notifyType === 'warning' ? '⚠️' : '📢';
+      return `${emoji} ${message || ''}`;
+    }
+    case 'setStatus': {
+      if (statusText) return `📍 [${statusKey}] ${statusText}`;
+      return ''; // 清除状态不通知
+    }
+    case 'setWidget': {
+      if (widgetLines && widgetLines.length > 0) {
+        return `📋 [${widgetKey || 'widget'}]\n${widgetLines.join('\n')}`;
+      }
+      return '';
+    }
+    case 'setTitle':
+      return `🏷️ ${title || ''}`;
+    case 'set_editor_text':
+      // 静默更新编辑器内容，不需要通知用户
+      return '';
+    default:
+      return '';
+  }
+}
+
 // ===== 消息处理 =====
 async function handleMessage(msg) {
   const userId = msg.FromUserName;
@@ -415,6 +720,13 @@ async function handleMessage(msg) {
   // 只处理文本消息
   if (msgType !== 'text' || !content) {
     await safeSend(config, userId, '⚠️ 目前只支持文本消息。');
+    return;
+  }
+
+  // ===== 优先处理 pending UI 请求 =====
+  // 如果用户有未回复的交互式请求（select/confirm/input/editor），用户的下一条消息
+  // 应作为对该请求的回复，而非新的 pi prompt。
+  if (await handleUIResponse(userId, content)) {
     return;
   }
 
@@ -441,6 +753,7 @@ async function handleMessage(msg) {
       '  /status             查看自己的状态\n' +
       '  /models             列出模型\n' +
       '  /abort              中止操作\n' +
+      '  /cancel              取消交互请求\n' +
       '  /help               帮助';
     if (isAdmin) {
       helpText +=
@@ -475,6 +788,14 @@ async function handleMessage(msg) {
   if (composingUsers.has(userId)) {
     composingUsers.get(userId).push(content);
     await safeSend(config, userId, `📝 已追加 (${composingUsers.get(userId).length} 段)，继续输入或发 /end`);
+    return;
+  }
+
+  // ===== /cancel — 取消交互请求 =====
+  if (content === '/cancel') {
+    // handleUIResponse 已经在有 pendingUIRequest 时处理了 /cancel
+    // 到这里说明没有 pending UI 请求
+    await safeSend(config, userId, 'ℹ️ 当前没有交互请求需要取消');
     return;
   }
 
@@ -653,6 +974,14 @@ async function handleMessage(msg) {
   if (content === '/abort') {
     const session = userSessions.get(userId);
     if (session?.busy) {
+      // 如果有 pending UI 请求，先取消
+      if (session.pendingUIRequest) {
+        try {
+          session.client.respondExtensionUI(session.pendingUIRequest.id, { cancelled: true });
+        } catch {}
+        session.pendingUIRequest = null;
+        session._clearUIRequestTimer();
+      }
       session.client.abort();
       if (session.streamBuffer) {
         try { await session.streamBuffer.abort(); } catch {}
@@ -677,6 +1006,10 @@ async function handleMessage(msg) {
       `- 流式: ${isStreamingEnabledFor(userId) ? '开启' : '关闭'}`,
       `- 多段输入: ${composingUsers.has(userId) ? `进行中 (${composingUsers.get(userId)?.length} 段)` : '无'}`,
     ];
+    if (session?.pendingUIRequest) {
+      // 只显示 method，不显示 title（title 来自 pi 扩展，可能含注入内容）
+      parts.push(`- 交互请求: ${session.pendingUIRequest.method} (等待回复)`);
+    }
     if (pref.hasCustomModel) {
       parts.push(`- 偏好模型: ${pref.provider}/${pref.modelId}`);
     }
@@ -982,6 +1315,7 @@ app.get('/health', (req, res) => {
       busy: session.busy,
       idleMs: Date.now() - session.lastActive,
       pid: session.client?.proc?.pid || null,
+      pendingUIRequest: session.pendingUIRequest ? { method: session.pendingUIRequest.method, id: session.pendingUIRequest.id } : null,
     });
     if (session.busy) totalBusy++;
   }

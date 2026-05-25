@@ -178,15 +178,24 @@ export class PiRpcClient {
    * 处理来自 pi 的消息
    */
   _handleMessage(msg) {
-    // 初始就绪信号: extension_ui_request
+    // extension_ui_request 有两种：
+    //   1) 初始连接时（无 method 字段）→ 回复空 UI 配置，标记就绪
+    //   2) 运行时交互请求（有 method 字段，如 select/confirm/input/editor/notify）
+    //      → 通过事件机制抛出，由外部（server.js）处理用户交互后调用 respondExtensionUI 回传
     if (msg.type === 'extension_ui_request') {
-      // 回复空的 UI 配置
-      this._sendCommand({
-        id: msg.id,
-        type: 'extension_ui_response',
-        ui: {},
-      });
-      if (this.onceReady) this.onceReady();
+      if (msg.method) {
+        // 运行时交互请求 — 通知外部监听器
+        console.log(`[pi-rpc] extension_ui_request: method=${msg.method}, id=${msg.id}`);
+        this._emit('extension_ui_request', msg);
+      } else {
+        // 初始就绪信号 → 回复空的 UI 配置
+        this._sendCommand({
+          id: msg.id,
+          type: 'extension_ui_response',
+          ui: {},
+        });
+        if (this.onceReady) this.onceReady();
+      }
       return;
     }
 
@@ -473,6 +482,22 @@ export class PiRpcClient {
     // 同步更新内部属性，确保进程重启后 start() 使用最新偏好
     this.thinking = level;
     return result;
+  }
+
+  /**
+   * 回复运行时 extension_ui_request
+   * @param {string} id - 请求的 id（来自 extension_ui_request）
+   * @param {object} response - 回复内容，根据 method 不同：
+   *   select/input/editor: { value: string } 或 { cancelled: true }
+   *   confirm: { confirmed: boolean } 或 { cancelled: true }
+   */
+  respondExtensionUI(id, response) {
+    if (!this.proc || !this.proc.stdin.writable) {
+      throw new Error('pi RPC 进程未运行');
+    }
+    const cmd = { type: 'extension_ui_response', id, ...response };
+    this._sendCommand(cmd);
+    console.log(`[pi-rpc] extension_ui_response: id=${id}`, JSON.stringify(response));
   }
 
   /**

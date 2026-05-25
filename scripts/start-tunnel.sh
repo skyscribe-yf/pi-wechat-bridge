@@ -16,8 +16,9 @@ URL_FILE="$LOG_DIR/tunnel-url.txt"
 echo "[tunnel] 启动 cloudflared quick tunnel → localhost:$BRIDGE_PORT ..."
 
 # 启动 cloudflared，日志写到文件
-cloudflared tunnel --url "http://localhost:$BRIDGE_PORT" > "$TUNNEL_LOG" 2>&1 &
+cloudflared tunnel --url "http://localhost:$BRIDGE_PORT" >> "$TUNNEL_LOG" 2>&1 &
 TUNNEL_PID=$!
+echo "$TUNNEL_PID" > "$LOG_DIR/cloudflared.pid"
 echo "[tunnel] cloudflared PID: $TUNNEL_PID"
 
 # 等待 URL 出现（最多 30 秒）
