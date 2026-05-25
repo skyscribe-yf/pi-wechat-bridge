@@ -39,7 +39,7 @@ const config = {
   piProvider: process.env.PI_PROVIDER,
   piModel: process.env.PI_MODEL,
   piThinking: process.env.PI_THINKING || 'medium',
-  piTools: process.env.PI_TOOLS || 'read,bash,edit,write,grep,find,ls',
+  piTools: process.env.PI_TOOLS || 'read,bash,edit,write,grep,find,ls,subagent,advisor,ask_user_question,todo,analyze_image,get_goal,create_goal,update_goal',
   piCwd: process.env.PI_CWD || process.cwd(),
   // 默认 false — 开启会话持久化，同一用户多轮对话共享上下文
   piNoSession: process.env.PI_NO_SESSION === 'true',

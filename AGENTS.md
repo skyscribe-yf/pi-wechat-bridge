@@ -56,7 +56,7 @@
 | `PI_PROVIDER` | 否 | LLM provider |
 | `PI_MODEL` | 否 | 模型 ID |
 | `PI_THINKING` | 否 | 思考等级，默认 `medium` |
-| `PI_TOOLS` | 否 | 允许的工具，默认 `read,bash,edit,write,grep,find,ls` |
+| `PI_TOOLS` | 否 | 允许的工具，默认 `read,bash,edit,write,grep,find,ls,subagent,advisor,ask_user_question,todo,analyze_image,get_goal,create_goal,update_goal` |
 | `PI_NO_SESSION` | 否 | 设 `true` 关闭会话持久化，默认 `false`（开启） |
 | `PI_APPEND_SYSTEM_PROMPT` | 否 | 追加 system prompt |
 | `PI_SESSION_IDLE_MS` | 否 | 空闲回收阈值，默认 1800000（30min） |
@@ -285,5 +285,5 @@ Windows 侧 `netsh interface portproxy` 或 cloudflared/ngrok。详见 `README.m
 - **不要将 `.env` 提交到 Git**
 - **ALLOWED_USERS** 生产环境必须配置
 - **ADMIN_USER** 建议配置，否则管理员命令不可用
-- pi 工具权限通过 `PI_TOOLS` 控制，默认只开放安全工具
+- pi 工具权限通过 `PI_TOOLS` 控制，默认开放安全工具和扩展工具（含 subagent、advisor 等）
 - 企业微信凭据不会注入 pi 子进程
