@@ -85,6 +85,7 @@
 - 会话持久化：`noSession=false`（默认），同一用户多轮对话共享 pi 上下文
 - `/clear`：停止 pi 进程并删除会话，下次消息自动重建
 - `/restart`：重启 pi 进程但保留会话上下文（比 /clear 更轻量）
+- `/restart-bridge`：管理员命令，重启桥接服务整体进程（先刷盘偏好，派生新进程后优雅退出）
 - `/compact`：触发上下文压缩（当对话历史过长时节省 token）
 - `/clear <userId>`、`/clear-all`：管理员命令，清除指定或全部会话
 - `/sessions`：管理员查看所有活跃会话（PID、空闲时间、busy 状态）
@@ -161,6 +162,7 @@ pi 以 `--mode rpc` 启动，JSONL 协议通信。
 - `/sessions`：查看所有活跃会话（含 PID、空闲时间、busy 状态）
 - `/clear <userId>`：清除指定用户会话
 - `/clear-all`：清除所有会话
+- `/restart-bridge`：重启桥接服务整体进程
 
 非管理员尝试执行时回复 `⛔ 此命令仅限管理员使用`。
 
@@ -275,7 +277,7 @@ Windows 侧 `netsh interface portproxy` 或 cloudflared/ngrok。详见 `README.m
 | 支持更多消息类型 | `server.js` 的 `handleMessage`，解析 `msg.MsgType` |
 | 添加新模型别名 | `server.js` 的 `modelAliases` |
 | 修改超时时间 | `server.js` 的 `ACTIVITY_TIMEOUT` / `HARD_TIMEOUT` |
-| 添加新 Bot 命令 | `server.js` 的 `handleMessage`（新增 /restart, /compact, steer 机制） |
+| 添加新 Bot 命令 | `server.js` 的 `handleMessage`（新增 /restart, /restart-bridge, /compact, steer 机制） |
 | 更换消息推送通道 | 替换 `wxwork-api.js` |
 | 修改 system prompt | `PI_APPEND_SYSTEM_PROMPT` 环境变量 |
 | 修改空闲回收时间 | `PI_SESSION_IDLE_MS` 环境变量 |
