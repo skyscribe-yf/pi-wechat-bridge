@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { encrypt, decrypt, verifySignature } from './wxwork-crypto.js';
 import { sendTextMessage, sendMarkdownMessage, updateCallbackUrl } from './wxwork-api.js';
 import { PiRpcClient } from './pi-rpc-client.js';
@@ -172,21 +173,21 @@ const modelAliases = {
   '讯飞': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
   'xunfei': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
   'astron': { provider: 'xunfei', modelId: 'astron-code-latest', name: '讯飞 Astron' },
-  'deepseek': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  'deepseek闪': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  'deepseek-flash': { provider: 'opencode-go', modelId: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  'deepseek-pro': { provider: 'opencode-go', modelId: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  'deepseek': { provider: 'commandcode', modelId: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  'deepseek闪': { provider: 'commandcode', modelId: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  'deepseek-flash': { provider: 'commandcode', modelId: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  'deepseek-pro': { provider: 'commandcode', modelId: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
   'kimi': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
   'kimi-k2.6': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
-  'mimo': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-  'mimo-pro': { provider: 'opencode-go', modelId: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
+  'mimo': { provider: 'commandcode', modelId: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
+  'mimo-pro': { provider: 'commandcode', modelId: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
   'mimo-flash': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: 'MiMo V2 Flash' },
   'xiaomi': { provider: 'xiaomi-mimo', modelId: 'mimo-v2-flash', name: '小米 MiMo' },
   'claude': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
   'sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
   'claude-sonnet': { provider: 'anthropic', modelId: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
-  'gpt': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
-  'gpt-5': { provider: 'opencode-go', modelId: 'gpt-5', name: 'GPT-5' },
+  'gpt': { provider: 'commandcode', modelId: 'gpt-5.4', name: 'GPT-5.4' },
+  'gpt-5': { provider: 'commandcode', modelId: 'gpt-5.4', name: 'GPT-5.4' },
   '可灵': { provider: 'kimi-coding', modelId: 'kimi-k2.6', name: 'Kimi K2.6' },
 };
 
@@ -526,7 +527,7 @@ async function handleUIResponse(userId, content) {
 
   // 核心命令豁免 — 这些命令即使在有 pending UI 请求时也应正常执行
   // /cancel 不豁免 — 有 pending UI 时作为取消 UI 请求处理
-  const COMMAND_EXEMPTIONS = ['/help', '/status', '/abort', '/restart'];
+  const COMMAND_EXEMPTIONS = ['/help', '/status', '/abort', '/restart', '/restart-bridge'];
   const trimmedLower = content.trim().toLowerCase();
   if (COMMAND_EXEMPTIONS.includes(trimmedLower)) {
     return false;  // 让这些命令走正常的 handleMessage 流程
@@ -740,6 +741,7 @@ async function handleMessage(msg) {
       '  /thinking high      思考等级\n' +
       '  /stream on|off      流式模式开关\n' +
       '  /restart             重启 pi 进程\n' +
+      '  /restart-bridge      重启桥接服务 (管理员)\n' +
       '  /compact             压缩上下文\n' +
       '  /clear              清除自己的会话\n' +
       '  /status             查看自己的状态\n' +
@@ -752,7 +754,8 @@ async function handleMessage(msg) {
         '\n\n👑 管理员命令:\n' +
         '  /sessions           查看所有活跃会话\n' +
         '  /clear <userId>     清除指定用户会话\n' +
-        '  /clear-all          清除所有会话';
+        '  /clear-all          清除所有会话\n' +
+        '  /restart-bridge     重启桥接服务';
     }
     await safeSend(config, userId, helpText);
     return;
@@ -834,7 +837,7 @@ async function handleMessage(msg) {
   // 非管理员尝试管理员命令
   const isAdmin = config.adminUser && userId === config.adminUser;
   const clearUserMatch = content.match(/^\/clear\s+(\S+)$/);
-  if (!isAdmin && (content === '/sessions' || content === '/clear-all' || clearUserMatch)) {
+  if (!isAdmin && (content === '/sessions' || content === '/clear-all' || clearUserMatch || content === '/restart-bridge')) {
     await safeSend(config, userId, '⛔ 此命令仅限管理员使用');
     return;
   }
@@ -905,6 +908,41 @@ async function handleMessage(msg) {
     userSessions.clear();
     if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
     await safeSend(config, userId, `🧹 已清除所有 ${count} 个会话`);
+    return;
+  }
+
+  // ===== /restart-bridge — 重启桥接服务（管理员） =====
+  if (content === '/restart-bridge' && isAdmin) {
+    await safeSend(config, userId, '🔄 正在重启桥接服务...');
+    // 标记所有 session 为主动关闭，防止 pi exit handler 试图自动重启拖慢关闭
+    for (const [, session] of userSessions) {
+      session._intentionalRestart = true;
+    }
+    // 先刷盘偏好，确保不丢数据
+    if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
+    await savePreferences();
+    // 先优雅关闭当前进程（释放端口、停 pi），关闭后再 spawn 新进程
+    // gracefulShutdown 支持 onShutdownDone 回调，用于在进程退出前 spawn 新进程
+    gracefulShutdown('/restart-bridge', async () => {
+      try {
+        const bridgeArgs = [path.join(import.meta.dirname, 'server.js')];
+        const logDir = process.env.TUNNEL_LOG_DIR || path.join(os.homedir(), 'logs', 'pi-wechat-bridge');
+        await fs.mkdir(logDir, { recursive: true });
+        const logFile = path.join(logDir, 'bridge.log');
+        const logFd = await fs.open(logFile, 'a');
+        const child = spawn(process.execPath, bridgeArgs, {
+          detached: true,
+          stdio: ['ignore', logFd, logFd],  // stdout/stderr 追加到日志文件
+          env: { ...process.env },  // 继承当前环境变量（含 .env）
+          cwd: process.cwd(),
+        });
+        child.unref();
+        logFd.close();  // 父进程关闭 fd，子进程已继承
+        console.log(`[bridge] 已派生新进程 PID=${child.pid}`);
+      } catch (err) {
+        console.error('[bridge] 派生新进程失败:', err.message);
+      }
+    });
     return;
   }
 
@@ -1414,7 +1452,7 @@ async function main() {
 
   // 不再全局启动 pi — 改为 per-user 惰性启动
 
-  app.listen(config.bridgePort, async () => {
+  const server = app.listen(config.bridgePort, async () => {
     console.log(`\n✅ 桥接服务器已启动: http://localhost:${config.bridgePort}`);
     console.log(`\n📋 企业微信配置回调 URL:`);
     console.log(`   URL: http://<你的服务器IP>:${config.bridgePort}/wxwork/callback`);
@@ -1422,10 +1460,24 @@ async function main() {
     console.log(`   EncodingAESKey: ${config.encodingAesKey}`);
     console.log(`\n💡 健康检查: http://localhost:${config.bridgePort}/health`);
 
+    // 检查重启标记：如果是由 /restart-bridge 触发的重启，通知管理员
+    const RESTART_FLAG_FILE = path.join(os.homedir(), '.pi', 'wechat-bridge', '.restart-bridge-flag');
+    try {
+      const flagData = await fs.readFile(RESTART_FLAG_FILE, 'utf8');
+      const flag = JSON.parse(flagData);
+      await fs.unlink(RESTART_FLAG_FILE);  // 删除标记
+      if (flag.userId && config.adminUser === flag.userId) {
+        const uptime = Math.round((Date.now() - flag.ts) / 1000);
+        await safeSend(config, flag.userId, `✅ 桥接服务已重启完成 (${uptime}s)`);
+        console.log(`[bridge] 已通知管理员 ${flag.userId} 重启完成`);
+      }
+    } catch {
+      // 标记文件不存在 → 正常启动，不是重启场景
+    }
   });
 }
 
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal, onShutdownDone) {
   console.log(`\n🛑 收到 ${signal}，正在关闭...`);
   const timer = setTimeout(() => { process.exit(1); }, 10000);
   timer.unref?.();
@@ -1438,6 +1490,14 @@ async function gracefulShutdown(signal) {
   // 刷盘偏好（确保退出前不丢数据）
   if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
   await savePreferences();
+
+  // 关闭 HTTP 服务器（释放端口）
+  server.close?.();
+
+  // 如果有回调（如 /restart-bridge 需要在关闭后 spawn 新进程），先执行
+  if (onShutdownDone) {
+    try { await onShutdownDone(); } catch (err) { console.error('[bridge] 关闭回调失败:', err.message); }
+  }
 
   setTimeout(() => { clearTimeout(timer); process.exit(0); }, 500);
 }

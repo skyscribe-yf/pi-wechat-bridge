@@ -56,9 +56,21 @@ RESULT=$(curl -s --connect-timeout 5 --max-time 15 \
 
 if echo "$RESULT" | grep -q '"ok"'; then
   echo "✅ [tunnel] 企业微信回调已更新"
+  # 通知管理员回调已更新
+  curl -s --connect-timeout 5 --max-time 15 \
+    -X POST "http://localhost:$BRIDGE_PORT/notify-admin" \
+    -H "Content-Type: application/json" \
+    -d "{\"message\": \"✅ Tunnel 已启动，回调 URL 已自动更新\n\n🔗 ${TUNNEL_URL}\n回调: ${CALLBACK_URL}\"}" \
+    2>/dev/null || true
 else
   echo "⚠️ [tunnel] 更新回调可能失败: $RESULT"
   echo "   请手动在管理后台设置回调 URL: $CALLBACK_URL"
+  # 通知管理员需要手动更新
+  curl -s --connect-timeout 5 --max-time 15 \
+    -X POST "http://localhost:$BRIDGE_PORT/notify-admin" \
+    -H "Content-Type: application/json" \
+    -d "{\"message\": \"⚠️ Tunnel 已启动，但回调 URL 自动更新失败\n\n🔗 ${TUNNEL_URL}\n回调: ${CALLBACK_URL}\n\n请手动在管理后台更新回调 URL\"}" \
+    2>/dev/null || true
 fi
 
 echo ""
