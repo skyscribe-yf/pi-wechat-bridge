@@ -1495,29 +1495,38 @@ async function main() {
 
 async function gracefulShutdown(signal, onShutdownDone) {
   console.log(`\n🛑 收到 ${signal}，正在关闭...`);
-  const timer = setTimeout(() => { process.exit(1); }, 10000);
-  timer.unref?.();
+  const timer = setTimeout(() => {
+    console.error('[bridge] ⚠️ 关闭超时 (10s)，强制退出');
+    process.exit(1);
+  }, 10000);
 
-  // 停止所有用户会话
-  for (const [, session] of userSessions) session.stop();
-  userSessions.clear();
-  if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
+  try {
+    // 停止所有用户会话
+    for (const [, session] of userSessions) session.stop();
+    userSessions.clear();
+    if (idleEvictTimer) { clearInterval(idleEvictTimer); idleEvictTimer = null; }
 
-  // 刷盘偏好（确保退出前不丢数据）
-  if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
-  await savePreferences();
+    // 刷盘偏好（确保退出前不丢数据）
+    if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
+    await savePreferences();
 
-  // 关闭 HTTP 服务器（释放端口）— 必须等待 close 完成后再 spawn 新进程，否则 EADDRINUSE
-  if (_httpServer) {
-    await new Promise(resolve => _httpServer.close(resolve));
+    // 关闭 HTTP 服务器（释放端口）— 先强制关闭所有活跃连接（如 cloudflared keep-alive），
+    // 再等待 close 回调，否则 keep-alive 连接会导致 close() 永远不回调
+    if (_httpServer) {
+      _httpServer.closeAllConnections?.();
+      await new Promise(resolve => _httpServer.close(resolve));
+    }
+
+    // 如果有回调（如 /restart-bridge 需要在关闭后 spawn 新进程），先执行
+    if (onShutdownDone) {
+      try { await onShutdownDone(); } catch (err) { console.error('[bridge] 关闭回调失败:', err.message); }
+    }
+  } catch (err) {
+    console.error('[bridge] 关闭过程中出错:', err.message);
   }
 
-  // 如果有回调（如 /restart-bridge 需要在关闭后 spawn 新进程），先执行
-  if (onShutdownDone) {
-    try { await onShutdownDone(); } catch (err) { console.error('[bridge] 关闭回调失败:', err.message); }
-  }
-
-  setTimeout(() => { clearTimeout(timer); process.exit(0); }, 500);
+  clearTimeout(timer);
+  setTimeout(() => process.exit(0), 500);
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
