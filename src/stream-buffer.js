@@ -54,7 +54,11 @@ export class StreamBuffer {
         this._appendThinking(event.delta);
         break;
       case 'tool_start':
-        this._enqueueEventMessage(formatToolStart(event));
+        // ask_user_question 等纯交互工具通过 extension_ui_request 渲染完整对话，
+        // 此处不再重复发送 tool_start 原始 JSON 通知，避免噪声。
+        if (!SILENT_TOOL_START.has(event.toolName)) {
+          this._enqueueEventMessage(formatToolStart(event));
+        }
         break;
       case 'tool_end':
         if (event.isError) this._enqueueEventMessage(formatToolError(event));
@@ -184,6 +188,15 @@ export class StreamBuffer {
 }
 
 // ---------- helpers ----------
+
+/**
+ * tool_start 事件中静默（不通知用户）的工具列表。
+ * 这些工具通过 extension_ui_request 渲染自己的交互对话框，
+ * 无需额外的 tool_start 原始参数通知。
+ */
+const SILENT_TOOL_START = new Set([
+  'ask_user_question',
+]);
 
 const MAX_CHUNK = 2000;
 
