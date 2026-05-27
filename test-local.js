@@ -70,20 +70,20 @@ async function testStreamBuffer() {
   const messages = [];
   const buffer = new StreamBuffer({
     send: (text) => { messages.push(text); return Promise.resolve(); },
-    threshold: 20,
-    thinkingThreshold: 30,
+    textFlushThreshold: 20,
+    thinkingFlushThreshold: 30,
     idleMs: 500,
-    interSendMs: 50,
+    interSendDelayMs: 50,
   });
 
   // 模拟进度事件（与 PiRpcClient onProgress 格式一致）
   buffer.handle({ type: 'text_delta', delta: 'Hello ' });
   buffer.handle({ type: 'text_delta', delta: 'World! ' });
   buffer.handle({ type: 'text_delta', delta: 'This is a test. ' });
-  buffer.handle({ type: 'thinking_delta', thinking: 'hmm... ' });
-  buffer.handle({ type: 'thinking_delta', thinking: 'thinking... ' });
-  buffer.handle({ type: 'tool_execution_start', data: { toolName: 'bash', toolInput: 'ls' } });
-  buffer.handle({ type: 'tool_execution_end', data: { toolName: 'bash', isError: false } });
+  buffer.handle({ type: 'thinking_delta', delta: 'hmm... ' });
+  buffer.handle({ type: 'thinking_delta', delta: 'thinking... ' });
+  buffer.handle({ type: 'tool_start', toolName: 'bash', args: { command: 'ls' } });
+  buffer.handle({ type: 'tool_end', toolName: 'bash', isError: false });
 
   await buffer.finalize();
   console.log(`  📝 发送了 ${messages.length} 条消息:`);

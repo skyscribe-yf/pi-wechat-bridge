@@ -165,6 +165,7 @@ export class PiRpcClient {
   _dispatchProgress(event) {
     for (const [, pending] of this.pendingRequests) {
       if (pending.text !== undefined && typeof pending.onProgress === 'function') {
+        pending.lastActivity = Date.now(); // 有活动则续期空闲计时器
         try {
           pending.onProgress(event);
         } catch (e) {
@@ -355,19 +356,30 @@ export class PiRpcClient {
     const id = `req-${this.nextId++}`;
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`pi 响应超时 (${timeout / 1000}s)`));
-      }, timeout);
+      // 使用空闲计时器代替固定 wall-clock 超时：_dispatchProgress 持续更新
+      // pending.lastActivity，只有真正静默超过 timeout 毫秒时才中止。
+      const pending = { resolve, reject, timer: null, text: '', onProgress, lastActivity: Date.now() };
 
-      this.pendingRequests.set(id, { resolve, reject, timer, text: '', onProgress });
+      const checkTimeout = () => {
+        const idle = Date.now() - pending.lastActivity;
+        if (idle >= timeout) {
+          this.pendingRequests.delete(id);
+          this.abort();
+          reject(new Error(`pi 响应超时 (${Math.round(timeout / 1000)}s 无活动)`));
+        } else {
+          pending.timer = setTimeout(checkTimeout, Math.min(30_000, timeout));
+        }
+      };
+      pending.timer = setTimeout(checkTimeout, Math.min(30_000, timeout));
+
+      this.pendingRequests.set(id, pending);
 
       try {
         this._sendCommand({ id, type: 'prompt', message });
         console.log(`[pi-rpc] 已发送 prompt: ${message.slice(0, 80)}...`);
       } catch (err) {
         this.pendingRequests.delete(id);
-        clearTimeout(timer);
+        clearTimeout(pending.timer);
         reject(err);
       }
     });

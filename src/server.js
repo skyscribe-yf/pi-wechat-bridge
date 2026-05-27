@@ -1191,24 +1191,17 @@ async function handlePiPrompt(userId, content) {
   session.lastActive = Date.now();
 
   // ===== 活动感知超时 =====
+  // 仅基于空闲时间判断，progress 事件持续到来时不触发任何超时。
   let lastActivity = Date.now();
-  const ACTIVITY_TIMEOUT = 120_000;  // 真正静默 2 分钟
-  const HARD_TIMEOUT = 600_000;      // 硬上限 10 分钟
+  const ACTIVITY_TIMEOUT = 120_000;  // 静默 2 分钟 → 释放锁（pi 仍运行）
+  const HARD_TIMEOUT = 600_000;      // pi-rpc-client 空闲超时阈值（传递给 prompt()）
   const CHECK_INTERVAL = 30_000;     // 每 30 秒检查
-
-  const promptStart = Date.now();
 
   function startActivityMonitor() {
     session._clearBusyTimer();
     session.busyTimer = setTimeout(() => {
       const idle = Date.now() - lastActivity;
-      const elapsed = Date.now() - promptStart;
-      if (elapsed > HARD_TIMEOUT) {
-        console.warn(`[pi-rpc:${userId}] 硬超时 (${Math.round(HARD_TIMEOUT / 1000)}s)`);
-        session.client.abort();
-        session.releaseBusy();
-        safeSend(config, userId, '⏰ 处理超时（硬上限 10min），已中止');
-      } else if (idle > ACTIVITY_TIMEOUT) {
+      if (idle > ACTIVITY_TIMEOUT) {
         console.warn(`[pi-rpc:${userId}] 静默超时 (${Math.round(idle / 1000)}s)`);
         session.releaseBusy();
         safeSend(config, userId, '⏰ pi 长时间无响应（2min），锁已释放。可用 /abort 强制中止');
@@ -1244,7 +1237,11 @@ async function handlePiPrompt(userId, content) {
         },
       };
     } else {
-      promptArg = { timeout: HARD_TIMEOUT };
+      // 非流式也需要更新 lastActivity，避免 pi 执行工具时被误判为静默超时
+      promptArg = {
+        timeout: HARD_TIMEOUT,
+        onProgress: () => { lastActivity = Date.now(); },
+      };
     }
 
     const reply = await session.client.prompt(content, promptArg);
