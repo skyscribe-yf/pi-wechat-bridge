@@ -27,6 +27,9 @@ process.on('unhandledRejection', (reason) => {
   console.error('[fatal] 未处理的 Promise 拒绝:', reason);
 });
 
+// ===== 模块级 HTTP 服务器引用（gracefulShutdown 需要） =====
+let _httpServer = null;
+
 // ===== 配置 =====
 const config = {
   corpId: process.env.WXWORK_CORP_ID,
@@ -921,6 +924,10 @@ async function handleMessage(msg) {
     // 先刷盘偏好，确保不丢数据
     if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
     await savePreferences();
+    // 写入重启标记文件，新进程启动后将通知管理员
+    const RESTART_FLAG_FILE = path.join(os.homedir(), '.pi', 'wechat-bridge', '.restart-bridge-flag');
+    await fs.mkdir(path.dirname(RESTART_FLAG_FILE), { recursive: true });
+    await fs.writeFile(RESTART_FLAG_FILE, JSON.stringify({ userId, ts: Date.now() }));
     // 先优雅关闭当前进程（释放端口、停 pi），关闭后再 spawn 新进程
     // gracefulShutdown 支持 onShutdownDone 回调，用于在进程退出前 spawn 新进程
     gracefulShutdown('/restart-bridge', async () => {
@@ -1452,7 +1459,8 @@ async function main() {
 
   // 不再全局启动 pi — 改为 per-user 惰性启动
 
-  const server = app.listen(config.bridgePort, async () => {
+  // 将 server 暴露给模块级 gracefulShutdown
+  _httpServer = app.listen(config.bridgePort, async () => {
     console.log(`\n✅ 桥接服务器已启动: http://localhost:${config.bridgePort}`);
     console.log(`\n📋 企业微信配置回调 URL:`);
     console.log(`   URL: http://<你的服务器IP>:${config.bridgePort}/wxwork/callback`);
@@ -1475,6 +1483,14 @@ async function main() {
       // 标记文件不存在 → 正常启动，不是重启场景
     }
   });
+  // 端口占用时给出明确错误而非 crash
+  _httpServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[bridge] ❌ 端口 ${config.bridgePort} 已被占用，请检查是否有其他实例在运行`);
+      process.exit(1);
+    }
+    throw err;
+  });
 }
 
 async function gracefulShutdown(signal, onShutdownDone) {
@@ -1491,8 +1507,10 @@ async function gracefulShutdown(signal, onShutdownDone) {
   if (prefSaveTimer) { clearTimeout(prefSaveTimer); prefSaveTimer = null; }
   await savePreferences();
 
-  // 关闭 HTTP 服务器（释放端口）
-  server.close?.();
+  // 关闭 HTTP 服务器（释放端口）— 必须等待 close 完成后再 spawn 新进程，否则 EADDRINUSE
+  if (_httpServer) {
+    await new Promise(resolve => _httpServer.close(resolve));
+  }
 
   // 如果有回调（如 /restart-bridge 需要在关闭后 spawn 新进程），先执行
   if (onShutdownDone) {
