@@ -101,10 +101,11 @@
 
 ### 3. 活动感知超时
 
-替代旧的固定 5 分钟 setTimeout：
-- **静默超时**：pi 连续 2 分钟无产出（text_delta / tool_execution 等）→ 释放锁
-- **硬上限**：单次 prompt 最多 10 分钟 → abort pi 并释放
-- **续期机制**：任何 `onProgress` 事件重置静默计时器
+纯空闲时间驱动，progress 事件持续到来时不触发任何超时：
+- **静默超时**：pi 连续 2 分钟无产出（text_delta / tool_execution 等）→ 释放锁（pi 仍在运行）
+- **空闲硬中止**：pi-rpc-client 级别：空闲超过 10 分钟（无任何 progress 事件）→ abort pi 并拒绝 Promise
+- **续期机制**：任何 `onProgress` 事件同时更新 server.js `lastActivity` 和 pi-rpc-client `pending.lastActivity`，双重续期
+- 非流式模式同样提供 `onProgress` 回调（仅更新 `lastActivity`，不输出流），防止工具调用期间被误判为静默
 - 每 30 秒检查一次
 
 ### 4. Markdown 渲染
